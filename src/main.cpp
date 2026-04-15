@@ -47,7 +47,7 @@ struct Map {
 };
 
 const Map maps[3] = {
-    { "OVAL",         "EASY",   TFT_GREEN,  TFT_GREEN,     320, 85  },
+    { "OVAL",         "EASY",   TFT_GREEN,  TFT_GREEN,     170, 110 },
     { "CITY CIRCUIT", "MEDIUM", TFT_YELLOW, TFT_DARKGREEN, 85,  165 },
     { "RAINBOW ROAD", "HARD",   TFT_RED,    TFT_BLACK,     85,  100 }
 };
@@ -67,6 +67,7 @@ int  countdownValue    = 3;
 unsigned long countdownTimer = 0;
 unsigned long lastTouchTime  = 0;
 bool screenNeedsRedraw = true;
+bool raceNeedsRedraw   = true;
 bool bleConnected      = false;
 
 // ─── Player World Position (camera anchor) ────────────────────────────────────
@@ -103,6 +104,8 @@ void drawArrowButton(int cx, int cy, bool pointRight);
 void wRect(int wx, int wy, int ww, int wh, uint16_t col);
 void wRRect(int wx, int wy, int ww, int wh, int r, uint16_t col);
 void wLine(int wx1, int wy1, int wx2, int wy2, uint16_t col);
+void wFEllipse(int wx, int wy, int rx, int ry, uint16_t col);
+void wEllipse(int wx, int wy, int rx, int ry, uint16_t col);
 
 void drawTrackWorld(int mapIdx);
 void drawMapPreviewBox(int mapIdx, int bx, int by, int bw, int bh);
@@ -188,7 +191,11 @@ void handleCurrentState() {
         case RACE:
             syncRaceStateBLE();
             handleRaceTouch();
-            drawRace();          // always redraw; movement will update playerWorldX/Y
+            if (screenNeedsRedraw || raceNeedsRedraw) {
+                drawRace();
+                screenNeedsRedraw = false;
+                raceNeedsRedraw = false;
+            }
             break;
 
         case ROUND_RESULT:
@@ -259,6 +266,16 @@ void wLine(int wx1, int wy1, int wx2, int wy2, uint16_t col) {
     M5.Display.drawLine(wx1 - camX(), wy1 - camY(), wx2 - camX(), wy2 - camY(), col);
 }
 
+// Draw a world-space filled ellipse, offset by camera
+void wFEllipse(int wx, int wy, int rx, int ry, uint16_t col) {
+    M5.Display.fillEllipse(wx - camX(), wy - camY(), rx, ry, col);
+}
+
+// Draw a world-space ellipse outline, offset by camera
+void wEllipse(int wx, int wy, int rx, int ry, uint16_t col) {
+    M5.Display.drawEllipse(wx - camX(), wy - camY(), rx, ry, col);
+}
+
 // =============================================================================
 // TRACK WORLD GEOMETRY
 // World space = 640 x 480.  Tracks are drawn with wRect/wRRect so the camera
@@ -270,19 +287,33 @@ void drawTrackWorld(int mapIdx) {
 
         // ── OVAL ── simple oval ring, track width ~80px ──────────────────────
         case 0:
-            // Road ring: fill outer oval, punch out inner with grass
-            wRRect(80,  60,  480, 360, 160, TFT_DARKGREY);
-            wRRect(180, 130, 280, 220, 120, TFT_GREEN);
-            // Start/finish line (checkerboard pair of rects)
-            wRect(302, 60, 18, 14, TFT_WHITE);
-            wRect(302, 74, 18, 14, TFT_BLACK);
-            wRect(320, 60, 18, 14, TFT_BLACK);
-            wRect(320, 74, 18, 14, TFT_WHITE);
-            // Kerbing on inside corners (red/white stripes)
-            wRect(180, 130, 40, 10, TFT_RED);
-            wRect(420, 130, 40, 10, TFT_RED);
-            wRect(180, 340, 40, 10, TFT_RED);
-            wRect(420, 340, 40, 10, TFT_RED);
+            // Build a clean oval ring with ellipses to avoid round-rect artifacts.
+            wFEllipse(320, 240, 250, 170, TFT_DARKGREY);
+            wFEllipse(320, 240, 170,  90, TFT_GREEN);
+            wEllipse(320, 240, 250, 170, TFT_WHITE);
+            wEllipse(320, 240, 170,  90, TFT_WHITE);
+
+            // Dashed lane markers on top/bottom straights.
+            for (int i = 0; i < 7; i++) {
+                int dx = 160 + i * 48;
+                wRect(dx, 114, 22, 3, TFT_WHITE);
+                wRect(dx, 364, 22, 3, TFT_WHITE);
+            }
+
+            // Red/white kerb strips on top and bottom straights.
+            for (int i = 0; i < 16; i++) {
+                uint16_t kerb = (i % 2 == 0) ? TFT_RED : TFT_WHITE;
+                wRect(116 + i * 26, 104, 16, 6, kerb);
+                wRect(116 + i * 26, 370, 16, 6, kerb);
+            }
+
+            // Vertical start/finish checkerboard near top-left straight.
+            for (int r = 0; r < 6; r++) {
+                for (int c = 0; c < 4; c++) {
+                    uint16_t tile = ((r + c) % 2 == 0) ? TFT_WHITE : TFT_BLACK;
+                    wRect(146 + c * 5, 108 + r * 5, 5, 5, tile);
+                }
+            }
             break;
 
         // ── CITY CIRCUIT ── cross-shaped road with centre lines ───────────────
@@ -359,16 +390,21 @@ void drawMapPreviewBox(int mapIdx, int bx, int by, int bw, int bh) {
     #define PRR(wx, wy, ww, wh, r, col) \
         M5.Display.fillRoundRect(bx + (int)((wx)*sx), by + (int)((wy)*sy), \
                                  max(2,(int)((ww)*sx)), max(2,(int)((wh)*sy)), r, col)
+    #define PE(wx, wy, rx, ry, col) \
+        M5.Display.fillEllipse(bx + (int)((wx)*sx), by + (int)((wy)*sy), \
+                               max(1,(int)((rx)*sx)), max(1,(int)((ry)*sy)), col)
+    #define PEO(wx, wy, rx, ry, col) \
+        M5.Display.drawEllipse(bx + (int)((wx)*sx), by + (int)((wy)*sy), \
+                               max(1,(int)((rx)*sx)), max(1,(int)((ry)*sy)), col)
 
     switch (mapIdx) {
         case 0:
             M5.Display.fillRect(bx, by, bw, bh, TFT_GREEN);
-            PRR(80, 60, 480, 360, 40, TFT_DARKGREY);
-            PRR(180,130, 280, 220, 30, TFT_GREEN);
-            PR(302, 60, 18, 14, TFT_WHITE);
-            PR(302, 74, 18, 14, TFT_BLACK);
-            PR(320, 60, 18, 14, TFT_BLACK);
-            PR(320, 74, 18, 14, TFT_WHITE);
+            PE(320, 240, 250, 170, TFT_DARKGREY);
+            PE(320, 240, 170,  90, TFT_GREEN);
+            PEO(320, 240, 250, 170, TFT_WHITE);
+            PEO(320, 240, 170,  90, TFT_WHITE);
+            PR(146, 108, 20, 30, TFT_WHITE);
             break;
         case 1:
             M5.Display.fillRect(bx, by, bw, bh, TFT_DARKGREEN);
@@ -399,6 +435,8 @@ void drawMapPreviewBox(int mapIdx, int bx, int by, int bw, int bh) {
 
     #undef PR
     #undef PRR
+    #undef PE
+    #undef PEO
 }
 
 // =============================================================================
@@ -480,6 +518,7 @@ void handleMapSelectTouch() {
 void resetPlayerForMap() {
     playerWorldX = maps[selectedMap].startX;
     playerWorldY = maps[selectedMap].startY;
+    raceNeedsRedraw = true;
 }
 
 void drawRaceHUD() {
@@ -501,6 +540,8 @@ void drawRaceHUD() {
 }
 
 void drawRace() {
+    M5.Display.startWrite();
+
     // 1. Fill screen with background colour for this map (cheap base layer)
     M5.Display.fillScreen(maps[selectedMap].bgColor);
 
@@ -512,6 +553,8 @@ void drawRace() {
 
     // 4. HUD drawn last so it sits on top of everything
     drawRaceHUD();
+
+    M5.Display.endWrite();
 }
 
 // =============================================================================
