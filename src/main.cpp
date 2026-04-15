@@ -17,22 +17,66 @@ enum GameState {
     BACK_TO_MENU
 };
 
-// ─── Global Game Data ─────────────────────────────────────────────────────────
-GameState currentState = START_SCREEN;
-GameState previousState = BACK_TO_MENU; // force first draw
+// ─── Vehicle Data ─────────────────────────────────────────────────────────────
+struct Vehicle {
+    const char* name;
+    const char* tagline;
+    int accel;
+    int handling;
+    int turning;
+    uint16_t color;
+};
 
-int playerWins   = 0;
-int opponentWins = 0;
-int selectedCharacter = 0;  // 0–4
-int selectedMap       = 0;  // 0–2
-int countdownValue    = 3;
+const Vehicle vehicles[3] = {
+    { "KART",  "All-Rounder",  3, 3, 3, TFT_RED   },
+    { "MOTO",  "Speed Demon",  5, 5, 2, TFT_BLUE  },
+    { "BUGGY", "Corner King",  2, 3, 5, TFT_GREEN }
+};
+const int NUM_VEHICLES = 3;
+
+// ─── Map Data ─────────────────────────────────────────────────────────────────
+// All tracks are defined in a 640x480 world space.
+// The camera centres on the player so only a 320x240 window is visible.
+struct Map {
+    const char* name;
+    const char* difficulty;
+    uint16_t    diffColor;
+    uint16_t    bgColor;      // screen background fill (grass / city / space)
+    float       startX;       // player spawn in world coords
+    float       startY;
+};
+
+const Map maps[3] = {
+    { "OVAL",         "EASY",   TFT_GREEN,  TFT_GREEN,     320, 85  },
+    { "CITY CIRCUIT", "MEDIUM", TFT_YELLOW, TFT_DARKGREEN, 85,  165 },
+    { "RAINBOW ROAD", "HARD",   TFT_RED,    TFT_BLACK,     85,  100 }
+};
+const int NUM_MAPS = 3;
+
+// ─── Global Game Data ─────────────────────────────────────────────────────────
+GameState currentState    = START_SCREEN;
+GameState previousState   = BACK_TO_MENU;
+
+int  playerWins        = 0;
+int  opponentWins      = 0;
+int  selectedCharacter = 0;
+int  selectedMap       = 0;
+int  previewCharacter  = 0;
+int  previewMap        = 0;
+int  countdownValue    = 3;
 unsigned long countdownTimer = 0;
+unsigned long lastTouchTime  = 0;
 bool screenNeedsRedraw = true;
-bool bleConnected = false;
+bool bleConnected      = false;
+
+// ─── Player World Position (camera anchor) ────────────────────────────────────
+float playerWorldX = 320.0f;
+float playerWorldY =  85.0f;
 
 // ─── Forward Declarations ─────────────────────────────────────────────────────
 void changeState(GameState next);
 void handleCurrentState();
+
 void drawStartScreen();
 void drawCharacterSelect();
 void drawMapSelect();
@@ -48,6 +92,23 @@ void handleCharacterSelectTouch();
 void handleMapSelectTouch();
 void handleRaceTouch();
 
+void drawVehicle(int type, int cx, int cy);
+void drawKart(int cx, int cy, uint16_t col);
+void drawMoto(int cx, int cy, uint16_t col);
+void drawBuggy(int cx, int cy, uint16_t col);
+void drawStatRow(int x, int y, const char* label, int value);
+void drawArrowButton(int cx, int cy, bool pointRight);
+
+// Camera-space world draw helpers
+void wRect(int wx, int wy, int ww, int wh, uint16_t col);
+void wRRect(int wx, int wy, int ww, int wh, int r, uint16_t col);
+void wLine(int wx1, int wy1, int wx2, int wy2, uint16_t col);
+
+void drawTrackWorld(int mapIdx);
+void drawMapPreviewBox(int mapIdx, int bx, int by, int bw, int bh);
+void drawRaceHUD();
+void resetPlayerForMap();
+
 void initBLE();
 void stopBLE();
 void initWiFi();
@@ -56,30 +117,27 @@ void syncRaceStateBLE();
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
-    M5.begin();
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.fillScreen(BLACK);
+    auto cfg = M5.config();
+    M5.begin(cfg);
+    M5.Display.setTextSize(2);
+    M5.Display.fillScreen(TFT_BLACK);
     Serial.begin(115200);
-
     changeState(START_SCREEN);
 }
 
 // ─── Main Loop ────────────────────────────────────────────────────────────────
 void loop() {
-    M5.update(); // updates touch + buttons
-
-    // Redraw screen only when state changes
+    M5.update();
     if (currentState != previousState) {
         screenNeedsRedraw = true;
         previousState = currentState;
     }
-
     handleCurrentState();
 }
 
 // ─── State Machine ────────────────────────────────────────────────────────────
 void changeState(GameState next) {
-    Serial.printf("State: %d → %d\n", currentState, next);
+    Serial.printf("State: %d -> %d\n", currentState, next);
     currentState = next;
     screenNeedsRedraw = true;
 }
@@ -93,12 +151,20 @@ void handleCurrentState() {
             break;
 
         case CHARACTER_SELECT:
-            if (screenNeedsRedraw) { drawCharacterSelect(); screenNeedsRedraw = false; }
+            if (screenNeedsRedraw) {
+                previewCharacter = selectedCharacter;
+                drawCharacterSelect();
+                screenNeedsRedraw = false;
+            }
             handleCharacterSelectTouch();
             break;
 
         case MAP_SELECT:
-            if (screenNeedsRedraw) { drawMapSelect(); screenNeedsRedraw = false; }
+            if (screenNeedsRedraw) {
+                previewMap = selectedMap;
+                drawMapSelect();
+                screenNeedsRedraw = false;
+            }
             handleMapSelectTouch();
             break;
 
@@ -106,79 +172,61 @@ void handleCurrentState() {
             if (screenNeedsRedraw) {
                 countdownValue = 3;
                 countdownTimer = millis();
+                resetPlayerForMap();
                 drawCountdown();
                 screenNeedsRedraw = false;
             }
-            // Tick down every 1 second
             if (millis() - countdownTimer >= 1000) {
                 countdownTimer = millis();
                 countdownValue--;
                 drawCountdown();
-                if (countdownValue <= 0) {
-                    changeState(RACE);
-                }
+                if (countdownValue <= 0) changeState(RACE);
             }
             break;
 
+        // RACE redraws every frame — player moves, world scrolls
         case RACE:
-            if (screenNeedsRedraw) { drawRace(); screenNeedsRedraw = false; }
-            syncRaceStateBLE();     // send/receive position over BLE
-            handleRaceTouch();      // item button, etc.
-            // TODO: detect race finish (lap completion logic goes here)
-            // if (raceFinished) changeState(ROUND_RESULT);
+            syncRaceStateBLE();
+            handleRaceTouch();
+            drawRace();          // always redraw; movement will update playerWorldX/Y
             break;
 
         case ROUND_RESULT:
             if (screenNeedsRedraw) {
-                // TODO: increment winner's score
-                // playerWins++ or opponentWins++
                 drawRoundResult();
                 screenNeedsRedraw = false;
             }
-            // Auto-advance after 3 seconds
-            if (millis() - countdownTimer >= 3000) {
-                changeState(CHECK_FIRST_TO_7);
-            }
+            if (millis() - countdownTimer >= 3000) changeState(CHECK_FIRST_TO_7);
             break;
 
         case CHECK_FIRST_TO_7:
-            if (playerWins >= 7 || opponentWins >= 7) {
-                changeState(FINAL_RESULT);
-            } else {
-                changeState(COUNTDOWN); // play another round
-            }
+            if (playerWins >= 7 || opponentWins >= 7) changeState(FINAL_RESULT);
+            else                                       changeState(COUNTDOWN);
             break;
 
         case FINAL_RESULT:
             if (screenNeedsRedraw) {
-                countdownTimer = millis(); // reuse as delay timer
+                countdownTimer = millis();
                 drawFinalResult();
                 screenNeedsRedraw = false;
             }
-            // Auto-advance to score upload after 2 seconds
-            if (millis() - countdownTimer >= 2000) {
-                changeState(UPLOAD_SCORE);
-            }
+            if (millis() - countdownTimer >= 2000) changeState(UPLOAD_SCORE);
             break;
 
         case UPLOAD_SCORE:
             if (screenNeedsRedraw) {
                 drawUploadScore();
                 screenNeedsRedraw = false;
-                stopBLE();          // IMPORTANT: stop BLE before starting WiFi
+                stopBLE();
                 initWiFi();
                 uploadScoreToGCP();
             }
-            // uploadScoreToGCP() should call changeState(BACK_TO_MENU) when done
             break;
 
         case BACK_TO_MENU:
             if (screenNeedsRedraw) { drawBackToMenu(); screenNeedsRedraw = false; }
-            // Reset all scores and selections
-            playerWins = 0;
-            opponentWins = 0;
-            selectedCharacter = 0;
-            selectedMap = 0;
+            playerWins = 0; opponentWins = 0;
+            selectedCharacter = 0; selectedMap = 0;
             bleConnected = false;
             delay(1500);
             changeState(START_SCREEN);
@@ -186,133 +234,496 @@ void handleCurrentState() {
     }
 }
 
-// ─── Screen Draw Stubs ────────────────────────────────────────────────────────
-void drawStartScreen() {
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.setTextColor(WHITE);
-    M5.Lcd.drawCentreString("KART RACER", 160, 60, 4);
-    // TODO: draw "1 Player" and "2 Player" touch buttons
-    M5.Lcd.drawCentreString("Touch to Start", 160, 180, 2);
+// =============================================================================
+// CAMERA HELPERS
+// The player is always drawn at screen centre (160, 120).
+// Every world object is offset by -(playerWorld - screenCentre).
+// =============================================================================
+
+// Camera top-left corner in world space
+inline int camX() { return (int)playerWorldX - 160; }
+inline int camY() { return (int)playerWorldY - 120; }
+
+// Draw a world-space filled rect, automatically offset by camera
+void wRect(int wx, int wy, int ww, int wh, uint16_t col) {
+    M5.Display.fillRect(wx - camX(), wy - camY(), ww, wh, col);
 }
 
-void drawCharacterSelect() {
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.drawCentreString("Pick Your Kart", 160, 20, 2);
-    // TODO: draw 4-5 kart buttons across the bottom
-    //       highlight selectedCharacter
+// Draw a world-space filled rounded rect, offset by camera
+void wRRect(int wx, int wy, int ww, int wh, int r, uint16_t col) {
+    M5.Display.fillRoundRect(wx - camX(), wy - camY(), ww, wh, r, col);
 }
+
+// Draw a world-space line, offset by camera
+void wLine(int wx1, int wy1, int wx2, int wy2, uint16_t col) {
+    M5.Display.drawLine(wx1 - camX(), wy1 - camY(), wx2 - camX(), wy2 - camY(), col);
+}
+
+// =============================================================================
+// TRACK WORLD GEOMETRY
+// World space = 640 x 480.  Tracks are drawn with wRect/wRRect so the camera
+// automatically shows the window around the player.
+// =============================================================================
+
+void drawTrackWorld(int mapIdx) {
+    switch (mapIdx) {
+
+        // ── OVAL ── simple oval ring, track width ~80px ──────────────────────
+        case 0:
+            // Road ring: fill outer oval, punch out inner with grass
+            wRRect(80,  60,  480, 360, 160, TFT_DARKGREY);
+            wRRect(180, 130, 280, 220, 120, TFT_GREEN);
+            // Start/finish line (checkerboard pair of rects)
+            wRect(302, 60, 18, 14, TFT_WHITE);
+            wRect(302, 74, 18, 14, TFT_BLACK);
+            wRect(320, 60, 18, 14, TFT_BLACK);
+            wRect(320, 74, 18, 14, TFT_WHITE);
+            // Kerbing on inside corners (red/white stripes)
+            wRect(180, 130, 40, 10, TFT_RED);
+            wRect(420, 130, 40, 10, TFT_RED);
+            wRect(180, 340, 40, 10, TFT_RED);
+            wRect(420, 340, 40, 10, TFT_RED);
+            break;
+
+        // ── CITY CIRCUIT ── cross-shaped road with centre lines ───────────────
+        case 1:
+            // Horizontal road
+            wRect(60,  140, 520, 80, TFT_DARKGREY);
+            // Vertical road
+            wRect(260,  60,  80, 360, TFT_DARKGREY);
+            // Intersection box (slightly lighter)
+            wRect(260, 140, 80, 80, 0x6B4D);
+            // Centre dashes – horizontal
+            for (int i = 0; i < 6; i++)
+                wRect(65 + i * 88, 175, 50, 8, TFT_WHITE);
+            // Centre dashes – vertical
+            for (int i = 0; i < 5; i++)
+                wRect(291, 65 + i * 72, 8, 44, TFT_WHITE);
+            // Pavements (lighter strips along road edges)
+            wRect(60, 136, 520,  8, 0x9CD3);
+            wRect(60, 216, 520,  8, 0x9CD3);
+            wRect(256,  60,   8, 360, 0x9CD3);
+            wRect(336,  60,   8, 360, 0x9CD3);
+            // Start/finish line
+            wRect(60, 152, 20, 48, TFT_WHITE);
+            break;
+
+        // ── RAINBOW ROAD ── colourful rectangular loop ────────────────────────
+        case 2: {
+            uint16_t c0 = M5.Display.color565( 80, 80, 220); // blue  – top
+            uint16_t c1 = M5.Display.color565(220, 80, 80);  // red   – right
+            uint16_t c2 = M5.Display.color565( 80,200, 80);  // green – bottom
+            uint16_t c3 = M5.Display.color565(220,180, 40);  // amber – left
+            // Four coloured road segments forming a loop
+            wRect( 60,  75, 520, 75, c0); // top
+            wRect(505,  75,  75, 330, c1); // right
+            wRect( 60, 330, 520, 75, c2); // bottom
+            wRect( 60,  75,  75, 330, c3); // left
+            // Black interior cutout
+            wRect(135, 150, 370, 180, TFT_BLACK);
+            // Sparkling edge lines (white dashes along each segment)
+            for (int i = 0; i < 8; i++) {
+                wRect( 75 + i * 62, 76,  40, 4, TFT_WHITE);   // top dashes
+                wRect( 75 + i * 62, 141, 40, 4, TFT_WHITE);
+                wRect( 75 + i * 62, 330, 40, 4, TFT_WHITE);   // bottom dashes
+                wRect( 75 + i * 62, 394, 40, 4, TFT_WHITE);
+            }
+            for (int i = 0; i < 5; i++) {
+                wRect( 60, 90 + i * 58, 4, 40, TFT_WHITE);    // left dashes
+                wRect(134, 90 + i * 58, 4, 40, TFT_WHITE);
+                wRect(506, 90 + i * 58, 4, 40, TFT_WHITE);    // right dashes
+                wRect(580, 90 + i * 58, 4, 40, TFT_WHITE);
+            }
+            // Start/finish
+            wRect(60,  92, 20, 58, TFT_WHITE);
+            break;
+        }
+    }
+}
+
+// =============================================================================
+// MAP PREVIEW  —  scaled-down version of the same track geometry.
+// bx/by = top-left of the preview box in screen coords, bw/bh = box size.
+// World is 640x480; we scale to bw x bh.
+// =============================================================================
+
+void drawMapPreviewBox(int mapIdx, int bx, int by, int bw, int bh) {
+    float sx = bw / 640.0f;
+    float sy = bh / 480.0f;
+
+    // Helper macros (local to this function via lambdas if compiler supports,
+    // otherwise inline — using a small local function approach):
+    #define PR(wx, wy, ww, wh, col) \
+        M5.Display.fillRect(bx + (int)((wx)*sx), by + (int)((wy)*sy), \
+                            max(1,(int)((ww)*sx)), max(1,(int)((wh)*sy)), col)
+    #define PRR(wx, wy, ww, wh, r, col) \
+        M5.Display.fillRoundRect(bx + (int)((wx)*sx), by + (int)((wy)*sy), \
+                                 max(2,(int)((ww)*sx)), max(2,(int)((wh)*sy)), r, col)
+
+    switch (mapIdx) {
+        case 0:
+            M5.Display.fillRect(bx, by, bw, bh, TFT_GREEN);
+            PRR(80, 60, 480, 360, 40, TFT_DARKGREY);
+            PRR(180,130, 280, 220, 30, TFT_GREEN);
+            PR(302, 60, 18, 14, TFT_WHITE);
+            PR(302, 74, 18, 14, TFT_BLACK);
+            PR(320, 60, 18, 14, TFT_BLACK);
+            PR(320, 74, 18, 14, TFT_WHITE);
+            break;
+        case 1:
+            M5.Display.fillRect(bx, by, bw, bh, TFT_DARKGREEN);
+            PR(60, 140, 520, 80, TFT_DARKGREY);
+            PR(260, 60,  80,360, TFT_DARKGREY);
+            PR(260,140,  80, 80, 0x6B4D);
+            PR(60, 136, 520,  8, 0x9CD3);
+            PR(60, 216, 520,  8, 0x9CD3);
+            PR(256, 60,   8,360, 0x9CD3);
+            PR(336, 60,   8,360, 0x9CD3);
+            PR(60, 152,  20, 48, TFT_WHITE);
+            break;
+        case 2: {
+            uint16_t c0 = M5.Display.color565( 80, 80,220);
+            uint16_t c1 = M5.Display.color565(220, 80, 80);
+            uint16_t c2 = M5.Display.color565( 80,200, 80);
+            uint16_t c3 = M5.Display.color565(220,180, 40);
+            M5.Display.fillRect(bx, by, bw, bh, TFT_BLACK);
+            PR( 60,  75, 520, 75, c0);
+            PR(505,  75,  75,330, c1);
+            PR( 60, 330, 520, 75, c2);
+            PR( 60,  75,  75,330, c3);
+            PR(135, 150, 370,180, TFT_BLACK);
+            PR( 60,  92,  20, 58, TFT_WHITE);
+            break;
+        }
+    }
+
+    #undef PR
+    #undef PRR
+}
+
+// =============================================================================
+// MAP SELECT  —  same cycle-through UX as character select
+// =============================================================================
 
 void drawMapSelect() {
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.drawCentreString("Pick a Track", 160, 20, 2);
-    // TODO: draw 3 map buttons (Map 1 / Map 2 / Map 3)
-}
+    M5.Display.fillScreen(TFT_BLACK);
 
-void drawCountdown() {
-    M5.Lcd.fillScreen(BLACK);
-    if (countdownValue > 0) {
-        M5.Lcd.drawCentreString(String(countdownValue), 160, 80, 7);
-    } else {
-        M5.Lcd.drawCentreString("GO!", 160, 80, 7);
+    // Title
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawCentreString("SELECT TRACK", 160, 6, 2);
+
+    // Position dots
+    for (int i = 0; i < NUM_MAPS; i++) {
+        uint16_t col = (i == previewMap) ? TFT_WHITE : TFT_DARKGREY;
+        M5.Display.fillCircle(148 + i * 12, 26, 4, col);
     }
-}
 
-void drawRace() {
-    M5.Lcd.fillScreen(DARKGREEN);
-    // TODO: draw track, kart sprites, HUD (lap count, item slot, position)
-    M5.Lcd.drawCentreString("RACE", 160, 10, 2);
-}
+    // Large preview box: 220 x 140, centred horizontally
+    const int px = 50, py = 36, pw = 220, ph = 140;
+    M5.Display.drawRect(px - 1, py - 1, pw + 2, ph + 2, TFT_DARKGREY);
+    drawMapPreviewBox(previewMap, px, py, pw, ph);
 
-void drawRoundResult() {
-    M5.Lcd.fillScreen(BLACK);
-    // TODO: show who won this round + current win totals
-    M5.Lcd.drawCentreString("Round Over!", 160, 60, 3);
-    M5.Lcd.setCursor(20, 130);
-    M5.Lcd.printf("You: %d  Opp: %d", playerWins, opponentWins);
-    countdownTimer = millis(); // start delay for auto-advance
-}
+    // Arrows at left/right midpoints of preview box
+    drawArrowButton(24,       py + ph / 2, false);
+    drawArrowButton(296,      py + ph / 2, true);
 
-void drawFinalResult() {
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.drawCentreString("GAME OVER", 160, 50, 3);
-    // TODO: display final winner, total wins
-    if (playerWins >= 7) {
-        M5.Lcd.drawCentreString("YOU WIN!", 160, 110, 4);
-    } else {
-        M5.Lcd.drawCentreString("YOU LOSE", 160, 110, 4);
-    }
-}
+    // Track name
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawCentreString(maps[previewMap].name, 160, 186, 3);
 
-void drawUploadScore() {
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.drawCentreString("Uploading score...", 160, 100, 2);
-}
+    // Difficulty badge
+    M5.Display.setTextColor(maps[previewMap].diffColor, TFT_BLACK);
+    M5.Display.drawCentreString(maps[previewMap].difficulty, 160, 214, 2);
 
-void drawBackToMenu() {
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.drawCentreString("Returning to menu...", 160, 100, 2);
-}
-
-// ─── Touch Handlers (Stub) ────────────────────────────────────────────────────
-void handleStartScreenTouch() {
-    auto touch = M5.Touch.getDetail();
-    if (touch.state == m5::touch_state_t::touch) { // screen was touched
-        changeState(CHARACTER_SELECT);
-    }
-}
-
-void handleCharacterSelectTouch() {
-    auto touch = M5.Touch.getDetail();
-    if (touch.state == m5::touch_state_t::touch) {
-        // TODO: determine which kart button was touched
-        // selectedCharacter = ...;
-        changeState(MAP_SELECT);
-    }
+    // Confirm hint
+    M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    M5.Display.drawCentreString("TAP TRACK TO SELECT", 160, 232, 1);
 }
 
 void handleMapSelectTouch() {
     auto touch = M5.Touch.getDetail();
-    if (touch.state == m5::touch_state_t::touch) {
-        // TODO: determine which map button was touched
-        // selectedMap = ...;
+    if (touch.state != m5::touch_state_t::touch_begin) return;
+    if (millis() - lastTouchTime < 200) return;
+    lastTouchTime = millis();
+
+    int tx = touch.x;
+    int ty = touch.y;
+    const int py = 36, ph = 140;
+
+    // Left arrow
+    if (tx < 55 && ty > py && ty < py + ph) {
+        previewMap = (previewMap - 1 + NUM_MAPS) % NUM_MAPS;
+        drawMapSelect();
+        return;
+    }
+    // Right arrow
+    if (tx > 265 && ty > py && ty < py + ph) {
+        previewMap = (previewMap + 1) % NUM_MAPS;
+        drawMapSelect();
+        return;
+    }
+    // Centre tap: confirm
+    if (tx >= 50 && tx <= 270 && ty >= py && ty <= py + ph) {
+        selectedMap = previewMap;
+        M5.Display.fillRect(50, py, 220, ph, TFT_WHITE);
+        delay(80);
+        drawMapSelect();
+        delay(120);
         changeState(COUNTDOWN);
     }
 }
 
-void handleRaceTouch() {
-    auto touch = M5.Touch.getDetail();
-    if (touch.state == m5::touch_state_t::touch) {
-        // TODO: check if touch is on the item button region
-        // if (touchInRect(touch, itemBtnX, itemBtnY, itemBtnW, itemBtnH)) useItem();
+// =============================================================================
+// RACE  —  camera follows player; vehicle is always at screen centre
+// =============================================================================
+
+void resetPlayerForMap() {
+    playerWorldX = maps[selectedMap].startX;
+    playerWorldY = maps[selectedMap].startY;
+}
+
+void drawRaceHUD() {
+    // Small black bar top-left: lap counter
+    M5.Display.fillRect(0, 0, 80, 18, TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawString("LAP 1/3", 4, 2, 1);
+
+    // Win counter top-right
+    M5.Display.fillRect(240, 0, 80, 18, TFT_BLACK);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d - %d", playerWins, opponentWins);
+    M5.Display.drawString(buf, 244, 2, 1);
+
+    // Vehicle name badge bottom-left
+    M5.Display.fillRect(0, 224, 90, 16, TFT_BLACK);
+    M5.Display.setTextColor(vehicles[selectedCharacter].color, TFT_BLACK);
+    M5.Display.drawString(vehicles[selectedCharacter].name, 4, 225, 1);
+}
+
+void drawRace() {
+    // 1. Fill screen with background colour for this map (cheap base layer)
+    M5.Display.fillScreen(maps[selectedMap].bgColor);
+
+    // 2. Draw all track geometry offset by camera — world scrolls, player stays centred
+    drawTrackWorld(selectedMap);
+
+    // 3. Player vehicle is ALWAYS drawn at exact screen centre
+    drawVehicle(selectedCharacter, 160, 120);
+
+    // 4. HUD drawn last so it sits on top of everything
+    drawRaceHUD();
+}
+
+// =============================================================================
+// CHARACTER SELECT  (unchanged from previous version)
+// =============================================================================
+
+void drawCharacterSelect() {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawCentreString("CHOOSE YOUR RIDE", 160, 6, 2);
+    for (int i = 0; i < NUM_VEHICLES; i++) {
+        uint16_t col = (i == previewCharacter) ? TFT_WHITE : TFT_DARKGREY;
+        M5.Display.fillCircle(148 + i * 12, 26, 4, col);
+    }
+    drawArrowButton(24,  98, false);
+    drawArrowButton(296, 98, true);
+    drawVehicle(previewCharacter, 160, 93);
+    M5.Display.setTextColor(vehicles[previewCharacter].color, TFT_BLACK);
+    M5.Display.drawCentreString(vehicles[previewCharacter].name, 160, 158, 4);
+    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    M5.Display.drawCentreString(vehicles[previewCharacter].tagline, 160, 180, 1);
+    drawStatRow(62, 194, "ACCEL   ", vehicles[previewCharacter].accel);
+    drawStatRow(62, 207, "HANDLING", vehicles[previewCharacter].handling);
+    drawStatRow(62, 220, "TURNING ", vehicles[previewCharacter].turning);
+    M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    M5.Display.drawCentreString("TAP VEHICLE TO SELECT", 160, 233, 1);
+}
+
+void drawStatRow(int x, int y, const char* label, int value) {
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawString(label, x, y, 1);
+    for (int i = 0; i < 5; i++) {
+        uint16_t col = (i < value) ? TFT_GREEN : 0x2104;
+        M5.Display.fillRect(x + 66 + i * 16, y, 12, 9, col);
+        M5.Display.drawRect(x + 66 + i * 16, y, 12, 9, TFT_DARKGREY);
     }
 }
 
-// ─── BLE / WiFi / GCP Stubs ───────────────────────────────────────────────────
-void initBLE() {
-    // TODO: initialize BLE server or client
-    // Reference your lab 3 UUID setup here
+void drawArrowButton(int cx, int cy, bool pointRight) {
+    M5.Display.fillRoundRect(cx - 20, cy - 22, 40, 44, 8, 0x2104);
+    M5.Display.drawRoundRect(cx - 20, cy - 22, 40, 44, 8, TFT_DARKGREY);
+    if (pointRight)
+        M5.Display.fillTriangle(cx - 8, cy - 12, cx + 12, cy, cx - 8, cy + 12, TFT_WHITE);
+    else
+        M5.Display.fillTriangle(cx + 8, cy - 12, cx - 12, cy, cx + 8, cy + 12, TFT_WHITE);
 }
 
-void stopBLE() {
-    // TODO: BLE.end() or equivalent
-    // Must be called BEFORE initWiFi() — ESP32 can't run both
+void handleCharacterSelectTouch() {
+    auto touch = M5.Touch.getDetail();
+    if (touch.state != m5::touch_state_t::touch_begin) return;
+    if (millis() - lastTouchTime < 200) return;
+    lastTouchTime = millis();
+    int tx = touch.x, ty = touch.y;
+    if (tx < 55 && ty > 50 && ty < 150) {
+        previewCharacter = (previewCharacter - 1 + NUM_VEHICLES) % NUM_VEHICLES;
+        drawCharacterSelect(); return;
+    }
+    if (tx > 265 && ty > 50 && ty < 150) {
+        previewCharacter = (previewCharacter + 1) % NUM_VEHICLES;
+        drawCharacterSelect(); return;
+    }
+    if (tx > 55 && tx < 265 && ty > 45 && ty < 155) {
+        selectedCharacter = previewCharacter;
+        M5.Display.fillRoundRect(55, 45, 210, 115, 8, TFT_WHITE);
+        delay(80);
+        drawCharacterSelect();
+        delay(120);
+        changeState(MAP_SELECT);
+    }
 }
 
-void initWiFi() {
-    // TODO: WiFi.begin(ssid, password)
-    // Wait for connection with timeout
+// =============================================================================
+// VEHICLE DRAWING  (unchanged)
+// =============================================================================
+
+void drawVehicle(int type, int cx, int cy) {
+    switch (type) {
+        case 0: drawKart (cx, cy, vehicles[0].color); break;
+        case 1: drawMoto (cx, cy, vehicles[1].color); break;
+        case 2: drawBuggy(cx, cy, vehicles[2].color); break;
+    }
 }
 
-void uploadScoreToGCP() {
-    // TODO: HTTP POST to your Cloud Function endpoint
-    // Body: JSON with playerWins, opponentWins, selectedCharacter, etc.
-    // On success: changeState(BACK_TO_MENU)
-    // On failure: show error, then changeState(BACK_TO_MENU) anyway
-    changeState(BACK_TO_MENU); // placeholder until implemented
+void drawKart(int cx, int cy, uint16_t col) {
+    uint16_t wc = TFT_DARKGREY;
+    M5.Display.fillRoundRect(cx - 44, cy - 30, 14, 20, 3, wc);
+    M5.Display.fillRoundRect(cx + 30, cy - 30, 14, 20, 3, wc);
+    M5.Display.fillRoundRect(cx - 44, cy + 14, 14, 20, 3, wc);
+    M5.Display.fillRoundRect(cx + 30, cy + 14, 14, 20, 3, wc);
+    M5.Display.fillRect(cx - 30, cy + 30, 60,  5, wc);
+    M5.Display.fillRect(cx - 26, cy + 33,  8, 10, wc);
+    M5.Display.fillRect(cx + 18, cy + 33,  8, 10, wc);
+    M5.Display.fillRoundRect(cx - 30, cy - 24, 60, 52, 6, col);
+    M5.Display.fillRoundRect(cx - 14, cy - 16, 28, 28, 5, 0x2104);
+    M5.Display.fillTriangle(cx - 18, cy - 24, cx + 18, cy - 24, cx, cy - 36, col);
+    M5.Display.fillCircle(cx, cy - 4, 10, TFT_WHITE);
+    M5.Display.fillCircle(cx, cy - 4,  7, TFT_YELLOW);
+    M5.Display.fillRect(cx - 32, cy + 4, 4, 8, TFT_ORANGE);
+    M5.Display.fillRect(cx + 28, cy + 4, 4, 8, TFT_ORANGE);
 }
 
-void syncRaceStateBLE() {
-    // TODO: send local kart position/lap over BLE
-    // TODO: receive opponent position/lap from BLE
-    // If connection drops: changeState(START_SCREEN) or show error
+void drawMoto(int cx, int cy, uint16_t col) {
+    uint16_t wc = TFT_DARKGREY, rim = 0x6B4D;
+    M5.Display.fillRoundRect(cx - 10, cy - 46, 20, 26, 5, wc);
+    M5.Display.fillRoundRect(cx - 10, cy + 22, 20, 26, 5, wc);
+    M5.Display.fillRoundRect(cx -  5, cy - 43, 10, 20, 3, rim);
+    M5.Display.fillRoundRect(cx -  5, cy + 25, 10, 20, 3, rim);
+    M5.Display.fillRoundRect(cx - 11, cy - 22, 22, 46, 4, col);
+    M5.Display.fillRect(cx - 24, cy - 18, 48,  5, 0xC618);
+    M5.Display.fillRect(cx - 24, cy - 26,  5,  8, 0xC618);
+    M5.Display.fillRect(cx + 19, cy - 26,  5,  8, 0xC618);
+    M5.Display.fillTriangle(cx - 8, cy - 22, cx + 8, cy - 22, cx, cy - 34, col);
+    M5.Display.drawLine(cx - 5, cy - 25, cx + 5, cy - 25, TFT_CYAN);
+    M5.Display.fillCircle(cx, cy - 8, 11, TFT_WHITE);
+    M5.Display.fillEllipse(cx, cy - 6,  7,  5, TFT_CYAN);
+    M5.Display.fillRect(cx + 11, cy + 6, 4, 18, TFT_ORANGE);
+    M5.Display.fillCircle(cx + 13, cy + 24, 3, TFT_YELLOW);
 }
+
+void drawBuggy(int cx, int cy, uint16_t col) {
+    uint16_t wc = 0x4208;
+    M5.Display.fillRoundRect(cx - 50, cy - 32, 18, 24, 4, wc);
+    M5.Display.fillRoundRect(cx + 32, cy - 32, 18, 24, 4, wc);
+    M5.Display.fillRoundRect(cx - 50, cy + 12, 18, 24, 4, wc);
+    M5.Display.fillRoundRect(cx + 32, cy + 12, 18, 24, 4, wc);
+    int wx[4] = { cx-50, cx+32, cx-50, cx+32 };
+    int wy[4] = { cy-32, cy-32, cy+12, cy+12 };
+    for (int i = 0; i < 4; i++) {
+        M5.Display.drawLine(wx[i]+5, wy[i]+4, wx[i]+5,  wy[i]+20, TFT_DARKGREY);
+        M5.Display.drawLine(wx[i]+11,wy[i]+4, wx[i]+11, wy[i]+20, TFT_DARKGREY);
+    }
+    M5.Display.drawLine(cx-28, cy-34, cx-28, cy-18, 0xC618);
+    M5.Display.drawLine(cx+28, cy-34, cx+28, cy-18, 0xC618);
+    M5.Display.drawLine(cx-28, cy-34, cx+28, cy-34, 0xC618);
+    M5.Display.fillRoundRect(cx - 32, cy - 26, 64, 56, 5, col);
+    M5.Display.fillRect(cx - 24, cy - 22, 48, 14, 0x03EF);
+    M5.Display.drawLine(cx - 24, cy - 22, cx + 24, cy - 22, TFT_CYAN);
+    M5.Display.fillCircle(cx, cy - 4, 10, TFT_WHITE);
+    M5.Display.fillEllipse(cx, cy - 2,  7,  4, 0x03EF);
+    M5.Display.fillRect(cx - 10, cy + 14,  8, 4, 0x2104);
+    M5.Display.fillRect(cx +  2, cy + 14,  8, 4, 0x2104);
+    M5.Display.fillRect(cx - 26, cy + 26, 52, 4, TFT_RED);
+}
+
+// =============================================================================
+// REMAINING SCREENS
+// =============================================================================
+
+void drawStartScreen() {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawCentreString("KART RACER", 160, 60, 4);
+    M5.Display.drawCentreString("Touch to Start", 160, 180, 2);
+}
+
+void drawCountdown() {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    if (countdownValue > 0) M5.Display.drawCentreString(String(countdownValue), 160, 80, 7);
+    else                    M5.Display.drawCentreString("GO!", 160, 80, 7);
+}
+
+void drawRoundResult() {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawCentreString("Round Over!", 160, 60, 3);
+    M5.Display.setCursor(20, 130);
+    M5.Display.printf("You: %d  Opp: %d", playerWins, opponentWins);
+    countdownTimer = millis();
+}
+
+void drawFinalResult() {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawCentreString("GAME OVER", 160, 50, 3);
+    if (playerWins >= 7) M5.Display.drawCentreString("YOU WIN!",  160, 110, 4);
+    else                 M5.Display.drawCentreString("YOU LOSE",  160, 110, 4);
+}
+
+void drawUploadScore() {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawCentreString("Uploading score...", 160, 100, 2);
+}
+
+void drawBackToMenu() {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawCentreString("Returning to menu...", 160, 100, 2);
+}
+
+// =============================================================================
+// REMAINING TOUCH HANDLERS
+// =============================================================================
+
+void handleStartScreenTouch() {
+    auto touch = M5.Touch.getDetail();
+    if (touch.state == m5::touch_state_t::touch_begin) changeState(CHARACTER_SELECT);
+}
+
+void handleRaceTouch() {
+    auto touch = M5.Touch.getDetail();
+    if (touch.state == m5::touch_state_t::touch_begin) {
+        // TODO: item button region check
+    }
+}
+
+// =============================================================================
+// BLE / WiFi / GCP STUBS
+// =============================================================================
+void initBLE()          { /* TODO */ }
+void stopBLE()          { /* TODO */ }
+void initWiFi()         { /* TODO */ }
+void uploadScoreToGCP() { changeState(BACK_TO_MENU); }
+void syncRaceStateBLE() { /* TODO */ }
