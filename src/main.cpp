@@ -2,8 +2,12 @@
 #include <NimBLEDevice.h>
 #include <Wire.h>
 #include <Adafruit_seesaw.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <Tween.h>
 #include <math.h>
+#include "secrets.h"
 
 // ─── State Definition ────────────────────────────────────────────────────────
 enum GameState {
@@ -12,6 +16,7 @@ enum GameState {
     MAP_SELECT,
     COUNTDOWN,
     RACE,
+    NAME_SELECT,
     ROUND_RESULT,
     CHECK_FIRST_TO_7,
     FINAL_RESULT,
@@ -97,15 +102,23 @@ unsigned long raceElapsedMs = 0;
 bool finalResultInputUnlocked = false;
 bool devComboLatched = false;
 
+const int PLAYER_NAME_LENGTH = 3;
+char currentPlayerName[PLAYER_NAME_LENGTH + 1] = "YOU";
+char nameEditBuffer[PLAYER_NAME_LENGTH + 1] = "YOU";
+int nameEditIndex = 0;
+
 struct LeaderboardEntry {
     char playerName[16];
     char mapName[24];
     uint8_t lapsCompleted;
-    unsigned long timeMs;
+    unsigned long totalTimeMs;
+    unsigned long lap1Ms;
+    unsigned long lap2Ms;
+    unsigned long lap3Ms;
     uint8_t vehicleIndex;
 };
 
-LeaderboardEntry latestRaceResult = { "YOU", "", 0, 0, 0 };
+LeaderboardEntry latestRaceResult = { "YOU", "", 0, 0, 0, 0, 0, 0 };
 bool leaderboardSyncQueued = false;
 
 Adafruit_seesaw gamepad;
@@ -136,6 +149,8 @@ int currentLap = 1;
 const int CHECKPOINT_SEQUENCE[8] = { 0, 1, 2, 3, 3, 2, 1, 0 };
 int checkpointSequencePos = 0;
 bool wasInCheckpoint[NUM_CHECKPOINTS] = { false, false, false, false };
+unsigned long lapSplitMs[TOTAL_LAPS] = { 0, 0, 0 };
+unsigned long lapStartElapsedMs = 0;
 
 Tween::Timeline controlTween;
 float smoothedSteer = 0.0f;
@@ -155,6 +170,7 @@ void drawCharacterSelect();
 void drawMapSelect();
 void drawCountdown();
 void drawRace();
+void drawNameSelect();
 void drawRoundResult();
 void drawFinalResult();
 void drawUploadScore();
@@ -164,6 +180,7 @@ void handleStartScreenTouch();
 void handleCharacterSelectTouch();
 void handleMapSelectTouch();
 void handleRaceTouch();
+void handleNameSelectInput();
 
 void drawVehicle(int type, int cx, int cy);
 void drawKart(int cx, int cy, uint16_t col);
@@ -201,6 +218,8 @@ void uploadScoreToGCP();
 void syncLeaderboardToGCP();
 void syncRaceStateBLE();
 
+int charSetIndex(char c);
+
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
     auto cfg = M5.config();
@@ -209,6 +228,19 @@ void setup() {
     M5.Display.fillScreen(TFT_BLACK);
     Serial.begin(115200);
     initGamepadQT();
+
+    if (strlen(LEADERBOARD_PLAYER_NAME) > 0) {
+        strncpy(currentPlayerName, LEADERBOARD_PLAYER_NAME, sizeof(currentPlayerName) - 1);
+        currentPlayerName[sizeof(currentPlayerName) - 1] = '\0';
+    }
+    currentPlayerName[PLAYER_NAME_LENGTH] = '\0';
+
+    for (int i = 0; i < PLAYER_NAME_LENGTH; i++) {
+        if (currentPlayerName[i] == '\0') {
+            currentPlayerName[i] = 'A';
+        }
+    }
+    currentPlayerName[PLAYER_NAME_LENGTH] = '\0';
     
     // Initialize sprite renderer for smooth animation
     frameSprite.setColorDepth(16);
@@ -249,6 +281,17 @@ void changeState(GameState next) {
     if (next == FINAL_RESULT) {
         finalResultInputUnlocked = false;
         devComboLatched = false;
+    } else if (next == NAME_SELECT) {
+        strncpy(nameEditBuffer, currentPlayerName, sizeof(nameEditBuffer) - 1);
+        nameEditBuffer[sizeof(nameEditBuffer) - 1] = '\0';
+        nameEditBuffer[PLAYER_NAME_LENGTH] = '\0';
+        for (int i = 0; i < PLAYER_NAME_LENGTH; i++) {
+            if (nameEditBuffer[i] == '\0') {
+                nameEditBuffer[i] = 'A';
+            }
+        }
+        nameEditBuffer[PLAYER_NAME_LENGTH] = '\0';
+        nameEditIndex = 0;
     }
 }
 
@@ -311,6 +354,14 @@ void handleCurrentState() {
             raceNeedsRedraw = false;
             break;
 
+        case NAME_SELECT:
+            if (screenNeedsRedraw) {
+                drawNameSelect();
+                screenNeedsRedraw = false;
+            }
+            handleNameSelectInput();
+            break;
+
         case ROUND_RESULT:
             if (screenNeedsRedraw) {
                 drawRoundResult();
@@ -345,6 +396,7 @@ void handleCurrentState() {
 
             bool playAgainPressed = M5.BtnA.wasClicked();
             bool menuPressed = M5.BtnC.wasClicked();
+            bool editNamePressed = M5.BtnB.wasClicked();
             if (gamepadConnected) {
                 uint32_t buttons = gamepad.digitalReadBulk(GAMEPAD_BUTTON_MASK);
                 playAgainPressed = playAgainPressed || !(buttons & (1UL << BUTTON_A));
@@ -359,6 +411,8 @@ void handleCurrentState() {
                 playerWins = 0;
                 opponentWins = 0;
                 changeState(BACK_TO_MENU);
+            } else if (editNamePressed) {
+                changeState(NAME_SELECT);
             }
             break;
         }
@@ -375,6 +429,10 @@ void handleCurrentState() {
 
         case BACK_TO_MENU:
             if (screenNeedsRedraw) { drawBackToMenu(); screenNeedsRedraw = false; }
+            if (leaderboardSyncQueued) {
+                initWiFi();
+                syncLeaderboardToGCP();
+            }
             playerWins = 0; opponentWins = 0;
             selectedCharacter = 0; selectedMap = 0;
             bleConnected = false;
@@ -722,6 +780,10 @@ void resetPlayerForMap() {
     lastRaceUpdateMs = 0;
     raceStartMs = millis();
     raceElapsedMs = 0;
+    lapStartElapsedMs = 0;
+    for (int i = 0; i < TOTAL_LAPS; i++) {
+        lapSplitMs[i] = 0;
+    }
     raceNeedsRedraw = true;
 }
 
@@ -735,9 +797,18 @@ void formatRaceTime(unsigned long elapsedMs, char* buffer, size_t bufferSize) {
 
 void captureRaceResultForLeaderboard() {
     latestRaceResult.lapsCompleted = (currentLap > TOTAL_LAPS) ? TOTAL_LAPS : (uint8_t)currentLap;
-    latestRaceResult.timeMs = raceElapsedMs;
+    latestRaceResult.totalTimeMs = raceElapsedMs;
+    latestRaceResult.lap1Ms = lapSplitMs[0];
+    latestRaceResult.lap2Ms = lapSplitMs[1];
+    latestRaceResult.lap3Ms = lapSplitMs[2];
     latestRaceResult.vehicleIndex = (uint8_t)selectedCharacter;
-    strncpy(latestRaceResult.playerName, "YOU", sizeof(latestRaceResult.playerName) - 1);
+    if (strlen(currentPlayerName) > 0) {
+        strncpy(latestRaceResult.playerName, currentPlayerName, sizeof(latestRaceResult.playerName) - 1);
+    } else if (strlen(LEADERBOARD_PLAYER_NAME) > 0) {
+        strncpy(latestRaceResult.playerName, LEADERBOARD_PLAYER_NAME, sizeof(latestRaceResult.playerName) - 1);
+    } else {
+        strncpy(latestRaceResult.playerName, "YOU", sizeof(latestRaceResult.playerName) - 1);
+    }
     latestRaceResult.playerName[sizeof(latestRaceResult.playerName) - 1] = '\0';
     strncpy(latestRaceResult.mapName, maps[selectedMap].name, sizeof(latestRaceResult.mapName) - 1);
     latestRaceResult.mapName[sizeof(latestRaceResult.mapName) - 1] = '\0';
@@ -795,6 +866,10 @@ void updateLapProgress() {
         if (i == CHECKPOINT_SEQUENCE[checkpointSequencePos] && inGate && !wasInCheckpoint[i]) {
             checkpointSequencePos++;
             if (checkpointSequencePos >= 8) {
+                if (currentLap >= 1 && currentLap <= TOTAL_LAPS) {
+                    lapSplitMs[currentLap - 1] = raceElapsedMs - lapStartElapsedMs;
+                    lapStartElapsedMs = raceElapsedMs;
+                }
                 currentLap++;
                 checkpointSequencePos = 0;
             }
@@ -930,6 +1005,10 @@ void handleDevCombo() {
     for (int i = 0; i < NUM_CHECKPOINTS; i++) {
         wasInCheckpoint[i] = false;
     }
+    for (int i = 0; i < TOTAL_LAPS; i++) {
+        lapSplitMs[i] = 0;
+    }
+    lapStartElapsedMs = raceElapsedMs;
     updateLapProgress();
 }
 
@@ -1209,6 +1288,79 @@ void drawCountdown() {
     else                    M5.Display.drawCentreString("GO!", 160, 80, 7);
 }
 
+void drawNameSelect() {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+    M5.Display.drawCentreString("SELECT NAME", 160, 20, 2);
+
+    const int boxY = 88;
+    for (int i = 0; i < 3; i++) {
+        int boxX = 100 + i * 40;
+        uint16_t border = (i == nameEditIndex) ? TFT_YELLOW : TFT_DARKGREY;
+        M5.Display.drawRect(boxX, boxY, 28, 36, border);
+        char ch[2] = { nameEditBuffer[i], '\0' };
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.drawCentreString(ch, boxX + 14, boxY + 8, 4);
+    }
+
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawCentreString("BtnA: Prev  BtnC: Next", 160, 160, 1);
+    M5.Display.drawCentreString("BtnB: Next letter / Done", 160, 174, 1);
+    M5.Display.drawCentreString("3 letters only", 160, 200, 1);
+}
+
+void handleNameSelectInput() {
+    const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const int charsetLen = (int)strlen(charset);
+
+    bool changed = false;
+
+    if (M5.BtnA.wasClicked()) {
+        int pos = charSetIndex(nameEditBuffer[nameEditIndex]);
+        pos = (pos - 1 + charsetLen) % charsetLen;
+        nameEditBuffer[nameEditIndex] = charset[pos];
+        changed = true;
+    }
+
+    if (M5.BtnC.wasClicked()) {
+        int pos = charSetIndex(nameEditBuffer[nameEditIndex]);
+        pos = (pos + 1) % charsetLen;
+        nameEditBuffer[nameEditIndex] = charset[pos];
+        changed = true;
+    }
+
+    if (M5.BtnB.wasClicked()) {
+        if (nameEditIndex < PLAYER_NAME_LENGTH - 1) {
+            nameEditIndex++;
+            changed = true;
+        } else {
+            strncpy(currentPlayerName, nameEditBuffer, sizeof(currentPlayerName) - 1);
+            currentPlayerName[sizeof(currentPlayerName) - 1] = '\0';
+            currentPlayerName[PLAYER_NAME_LENGTH] = '\0';
+
+            // Update already-finished race record so the next sync sends the new name.
+            strncpy(latestRaceResult.playerName, currentPlayerName, sizeof(latestRaceResult.playerName) - 1);
+            latestRaceResult.playerName[sizeof(latestRaceResult.playerName) - 1] = '\0';
+            leaderboardSyncQueued = true;
+
+            changeState(FINAL_RESULT);
+            return;
+        }
+    }
+
+    if (changed) {
+        drawNameSelect();
+    }
+}
+
+int charSetIndex(char c) {
+    const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+    for (int i = 0; charset[i] != '\0'; i++) {
+        if (charset[i] == c) return i;
+    }
+    return 0;
+}
+
 void drawRoundResult() {
     M5.Display.fillScreen(TFT_BLACK);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -1226,20 +1378,32 @@ void drawFinalResult() {
     M5.Display.drawCentreString("LEADERBOARD", 160, 36, 2);
 
     M5.Display.drawRect(22, 64, 276, 120, TFT_DARKGREY);
+    char totalTimeBuf[16];
+    if (latestRaceResult.totalTimeMs > 0) {
+        formatRaceTime(latestRaceResult.totalTimeMs, totalTimeBuf, sizeof(totalTimeBuf));
+    } else {
+        strncpy(totalTimeBuf, "--:--.-", sizeof(totalTimeBuf) - 1);
+        totalTimeBuf[sizeof(totalTimeBuf) - 1] = '\0';
+    }
+
+    char line1[28];
+    snprintf(line1, sizeof(line1), "1. %s", latestRaceResult.playerName);
+
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.drawString("1. YOU", 34, 78, 2);
-    M5.Display.drawString("2. CPU_A", 34, 108, 2);
-    M5.Display.drawString("3. CPU_B", 34, 138, 2);
+    M5.Display.drawString(line1, 34, 78, 2);
+    M5.Display.drawString("2. --------", 34, 108, 2);
+    M5.Display.drawString("3. --------", 34, 138, 2);
 
     M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
-    M5.Display.drawString("3/3 LAPS", 208, 78, 2);
+    M5.Display.drawString(totalTimeBuf, 208, 78, 2);
     M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    M5.Display.drawString("2/3 LAPS", 208, 108, 2);
-    M5.Display.drawString("1/3 LAPS", 208, 138, 2);
+    M5.Display.drawString("--:--.-", 208, 108, 2);
+    M5.Display.drawString("--:--.-", 208, 138, 2);
 
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
     M5.Display.drawCentreString("BtnA: Play Again", 160, 196, 1);
-    M5.Display.drawCentreString("BtnC (Y): Menu", 160, 208, 1);
+    M5.Display.drawCentreString("BtnB: Edit Name", 160, 208, 1);
+    M5.Display.drawCentreString("BtnC (Y): Menu", 160, 220, 1);
 }
 
 void drawUploadScore() {
@@ -1275,15 +1439,103 @@ void handleRaceTouch() {
 // =============================================================================
 void initBLE()          { /* TODO */ }
 void stopBLE()          { /* TODO */ }
-void initWiFi()         { /* TODO */ }
+void initWiFi() {
+    if (strlen(WIFI_SSID) == 0 || strlen(WIFI_PASSWORD) == 0) {
+        Serial.println("WiFi credentials missing in include/secrets.h");
+        return;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        return;
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    Serial.print("Connecting to WiFi");
+    const unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 12000) {
+        delay(250);
+        Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("WiFi connected. IP: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("WiFi connection timed out");
+    }
+}
 void uploadScoreToGCP() { changeState(BACK_TO_MENU); }
 void syncLeaderboardToGCP() {
     if (!leaderboardSyncQueued) return;
 
-    // Groundwork for future cross-user sync:
-    // - latestRaceResult contains the finished race snapshot
-    // - this stub is where an HTTPS POST to GCP can serialize that snapshot
-    // - keep the upload path separate so local gameplay stays offline-safe
-    leaderboardSyncQueued = false;
+    if (strlen(GCP_LEADERBOARD_URL) == 0) {
+        Serial.println("GCP leaderboard URL missing in include/secrets.h");
+        return;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        initWiFi();
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Skipping leaderboard sync: WiFi unavailable");
+        return;
+    }
+
+    char payload[512];
+    snprintf(
+        payload,
+        sizeof(payload),
+        "{\"name\":\"%s\",\"score\":%lu,\"playerName\":\"%s\",\"map\":\"%s\",\"lapsCompleted\":%u,\"totalTimeMs\":%lu,\"lap1Ms\":%lu,\"lap2Ms\":%lu,\"lap3Ms\":%lu,\"vehicleIndex\":%u}",
+        latestRaceResult.playerName,
+        latestRaceResult.totalTimeMs,
+        latestRaceResult.playerName,
+        latestRaceResult.mapName,
+        latestRaceResult.lapsCompleted,
+        latestRaceResult.totalTimeMs,
+        latestRaceResult.lap1Ms,
+        latestRaceResult.lap2Ms,
+        latestRaceResult.lap3Ms,
+        latestRaceResult.vehicleIndex
+    );
+
+    Serial.printf("Posting leaderboard score to %s\n", GCP_LEADERBOARD_URL);
+    Serial.println(payload);
+
+    WiFiClientSecure tlsClient;
+    if (GCP_ALLOW_INSECURE_TLS) {
+        tlsClient.setInsecure();
+    }
+
+    HTTPClient https;
+    if (!https.begin(tlsClient, GCP_LEADERBOARD_URL)) {
+        Serial.println("Failed to initialize HTTPS client");
+        return;
+    }
+
+    https.addHeader("Content-Type", "application/json");
+    if (strlen(GCP_API_BEARER_TOKEN) > 0) {
+        char authHeader[220];
+        snprintf(authHeader, sizeof(authHeader), "Bearer %s", GCP_API_BEARER_TOKEN);
+        https.addHeader("Authorization", authHeader);
+    }
+
+    int code = https.POST((uint8_t*)payload, strlen(payload));
+    String response = https.getString();
+    https.end();
+
+    Serial.printf("Leaderboard sync code: %d\n", code);
+    if (code <= 0) {
+        Serial.printf("Leaderboard sync error: %s\n", https.errorToString(code).c_str());
+    }
+    if (response.length() > 0) {
+        Serial.println(response);
+    }
+
+    if (code >= 200 && code < 300) {
+        leaderboardSyncQueued = false;
+    }
 }
 void syncRaceStateBLE() { /* TODO */ }
