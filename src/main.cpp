@@ -7,7 +7,13 @@
 #include <HTTPClient.h>
 #include <Tween.h>
 #include <math.h>
-#include "secrets.h"
+
+static const char* LEADERBOARD_PLAYER_NAME = "CBU";
+static const char* WIFI_SSID = "CBU-LANCERS";
+static const char* WIFI_PASSWORD = "L@ncerN@tion";
+static const char* GCP_LEADERBOARD_URL = "https://leaderboardpusher-734706803358.europe-west1.run.app";
+static const char* GCP_API_BEARER_TOKEN = "";
+static const bool GCP_ALLOW_INSECURE_TLS = true;
 
 // ─── State Definition ────────────────────────────────────────────────────────
 enum GameState {
@@ -1469,26 +1475,37 @@ void initWiFi() {
 }
 void uploadScoreToGCP() { changeState(BACK_TO_MENU); }
 void syncLeaderboardToGCP() {
+    Serial.println("=== syncLeaderboardToGCP called ===");
+    Serial.printf("queued=%d  url_len=%d  wifi=%d\n",
+        leaderboardSyncQueued, strlen(GCP_LEADERBOARD_URL), WiFi.status());
+
     if (!leaderboardSyncQueued) return;
+    if (strlen(GCP_LEADERBOARD_URL) == 0) return;
 
-    if (strlen(GCP_LEADERBOARD_URL) == 0) {
-        Serial.println("GCP leaderboard URL missing in include/secrets.h");
+    // Show upload status on screen so you don't need Serial monitor
+    M5.Display.fillRect(0, 0, 320, 16, TFT_BLACK);
+    M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    M5.Display.drawString("Connecting WiFi...", 4, 2, 1);
+
+    if (WiFi.status() != WL_CONNECTED) initWiFi();
+
+    if (WiFi.status() != WL_CONNECTED) {
+        M5.Display.fillRect(0, 0, 320, 16, TFT_BLACK);
+        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+        M5.Display.drawString("WiFi FAILED", 4, 2, 1);
+        Serial.println("Skipping: WiFi unavailable");
         return;
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
-        initWiFi();
-    }
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Skipping leaderboard sync: WiFi unavailable");
-        return;
-    }
+    M5.Display.fillRect(0, 0, 320, 16, TFT_BLACK);
+    M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+    M5.Display.drawString("Uploading...", 4, 2, 1);
 
     char payload[512];
-    snprintf(
-        payload,
-        sizeof(payload),
-        "{\"name\":\"%s\",\"score\":%lu,\"playerName\":\"%s\",\"map\":\"%s\",\"lapsCompleted\":%u,\"totalTimeMs\":%lu,\"lap1Ms\":%lu,\"lap2Ms\":%lu,\"lap3Ms\":%lu,\"vehicleIndex\":%u}",
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"%s\",\"score\":%lu,\"playerName\":\"%s\","
+        "\"map\":\"%s\",\"lapsCompleted\":%u,\"totalTimeMs\":%lu,"
+        "\"lap1Ms\":%lu,\"lap2Ms\":%lu,\"lap3Ms\":%lu,\"vehicleIndex\":%u}",
         latestRaceResult.playerName,
         latestRaceResult.totalTimeMs,
         latestRaceResult.playerName,
@@ -1501,17 +1518,17 @@ void syncLeaderboardToGCP() {
         latestRaceResult.vehicleIndex
     );
 
-    Serial.printf("Posting leaderboard score to %s\n", GCP_LEADERBOARD_URL);
-    Serial.println(payload);
+    Serial.printf("Payload: %s\n", payload);
 
     WiFiClientSecure tlsClient;
-    if (GCP_ALLOW_INSECURE_TLS) {
-        tlsClient.setInsecure();
-    }
+    if (GCP_ALLOW_INSECURE_TLS) tlsClient.setInsecure();
 
     HTTPClient https;
     if (!https.begin(tlsClient, GCP_LEADERBOARD_URL)) {
-        Serial.println("Failed to initialize HTTPS client");
+        M5.Display.fillRect(0, 0, 320, 16, TFT_BLACK);
+        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+        M5.Display.drawString("HTTPS begin FAILED", 4, 2, 1);
+        Serial.println("HTTPS begin failed");
         return;
     }
 
@@ -1526,16 +1543,21 @@ void syncLeaderboardToGCP() {
     String response = https.getString();
     https.end();
 
-    Serial.printf("Leaderboard sync code: %d\n", code);
-    if (code <= 0) {
-        Serial.printf("Leaderboard sync error: %s\n", https.errorToString(code).c_str());
-    }
-    if (response.length() > 0) {
-        Serial.println(response);
-    }
+    Serial.printf("HTTP code: %d\n", code);
+    Serial.println(response);
 
+    // Show result on screen
+    M5.Display.fillRect(0, 0, 320, 16, TFT_BLACK);
     if (code >= 200 && code < 300) {
+        M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+        M5.Display.drawString("Score uploaded!", 4, 2, 1);
         leaderboardSyncQueued = false;
+    } else {
+        char errBuf[32];
+        snprintf(errBuf, sizeof(errBuf), "Upload failed: %d", code);
+        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+        M5.Display.drawString(errBuf, 4, 2, 1);
     }
+    delay(1500);
 }
 void syncRaceStateBLE() { /* TODO */ }
