@@ -151,10 +151,14 @@ float playerHeadingRad = 0.0f;
 
 const int TOTAL_LAPS = 3;
 const int NUM_CHECKPOINTS = 4;
+const int MAX_CHECKPOINTS = 8;
+const int CHECKPOINT_SEQUENCE_LEN = 4;
+const int OVAL_CHECKPOINT_SEQUENCE_LEN = 8;
 int currentLap = 1;
-const int CHECKPOINT_SEQUENCE[8] = { 0, 1, 2, 3, 3, 2, 1, 0 };
+const int CHECKPOINT_SEQUENCE[CHECKPOINT_SEQUENCE_LEN] = { 0, 1, 2, 3 };
+const int OVAL_CHECKPOINT_SEQUENCE[OVAL_CHECKPOINT_SEQUENCE_LEN] = { 0, 1, 2, 3, 4, 5, 6, 7 };
 int checkpointSequencePos = 0;
-bool wasInCheckpoint[NUM_CHECKPOINTS] = { false, false, false, false };
+bool wasInCheckpoint[MAX_CHECKPOINTS] = { false, false, false, false, false, false, false, false };
 unsigned long lapSplitMs[TOTAL_LAPS] = { 0, 0, 0 };
 unsigned long lapStartElapsedMs = 0;
 
@@ -203,6 +207,7 @@ void wFEllipse(int wx, int wy, int rx, int ry, uint16_t col);
 void wEllipse(int wx, int wy, int rx, int ry, uint16_t col);
 
 void drawTrackWorld(int mapIdx);
+void drawActiveCheckpointGuide(int mapIdx);
 void drawMapPreviewBox(int mapIdx, int bx, int by, int bw, int bh);
 void drawRaceHUD();
 void resetPlayerForMap();
@@ -529,6 +534,87 @@ void wEllipse(int wx, int wy, int rx, int ry, uint16_t col) {
 // automatically shows the window around the player.
 // =============================================================================
 
+void drawActiveCheckpointGuide(int mapIdx) {
+    const bool splitOvalCheckpoints = (mapIdx == 0 || mapIdx == 3);
+    const int sequenceLen = splitOvalCheckpoints ? OVAL_CHECKPOINT_SEQUENCE_LEN : CHECKPOINT_SEQUENCE_LEN;
+    const int* sequence = splitOvalCheckpoints ? OVAL_CHECKPOINT_SEQUENCE : CHECKPOINT_SEQUENCE;
+
+    int activeSequencePos = checkpointSequencePos;
+    if (activeSequencePos < 0 || activeSequencePos >= sequenceLen) {
+        activeSequencePos = 0;
+    }
+    int checkpointIdx = sequence[activeSequencePos];
+
+    switch (mapIdx) {
+        case 0: // OVAL
+            if (checkpointIdx == 0) {
+                wRect(312, 180, 16, 160, TFT_CYAN);
+            } else if (checkpointIdx == 1) {
+                wRect(472, 180, 16, 160, TFT_CYAN);
+            } else if (checkpointIdx == 2) {
+                wRect(792, 180, 16, 160, TFT_CYAN);
+            } else if (checkpointIdx == 3) {
+                wRect(952, 180, 16, 160, TFT_CYAN);
+            } else if (checkpointIdx == 4) {
+                wRect(952, 620, 16, 160, TFT_CYAN);
+            } else if (checkpointIdx == 5) {
+                wRect(792, 620, 16, 160, TFT_CYAN);
+            } else if (checkpointIdx == 6) {
+                wRect(472, 620, 16, 160, TFT_CYAN);
+            } else {
+                wRect(312, 620, 16, 160, TFT_CYAN);
+            }
+            break;
+
+        case 1: // CITY CIRCUIT
+            if (checkpointIdx == 0) {
+                wRect(540, 120, 16, 720, TFT_CYAN);
+            } else if (checkpointIdx == 1) {
+                wRect(572, 120, 16, 720, TFT_CYAN);
+            } else if (checkpointIdx == 2) {
+                wRect(612, 120, 16, 720, TFT_CYAN);
+            } else {
+                wRect(644, 120, 16, 720, TFT_CYAN);
+            }
+            break;
+
+        case 2: // RAINBOW ROAD
+            if (checkpointIdx == 0) {
+                wRect(182, 150, 16, 660, TFT_CYAN);
+            } else if (checkpointIdx == 1) {
+                wRect(402, 150, 16, 150, TFT_CYAN);
+                wRect(402, 660, 16, 150, TFT_CYAN);
+            } else if (checkpointIdx == 2) {
+                wRect(857, 150, 16, 150, TFT_CYAN);
+                wRect(857, 660, 16, 150, TFT_CYAN);
+            } else {
+                wRect(1077, 150, 16, 660, TFT_CYAN);
+            }
+            break;
+
+        case 3: // POINT OVAL
+        default:
+            if (checkpointIdx == 0) {
+                wRect(468, 240, 16, 120, TFT_CYAN);
+            } else if (checkpointIdx == 1) {
+                wRect(548, 240, 16, 120, TFT_CYAN);
+            } else if (checkpointIdx == 2) {
+                wRect(708, 240, 16, 120, TFT_CYAN);
+            } else if (checkpointIdx == 3) {
+                wRect(788, 240, 16, 120, TFT_CYAN);
+            } else if (checkpointIdx == 4) {
+                wRect(788, 600, 16, 120, TFT_CYAN);
+            } else if (checkpointIdx == 5) {
+                wRect(708, 600, 16, 120, TFT_CYAN);
+            } else if (checkpointIdx == 6) {
+                wRect(548, 600, 16, 120, TFT_CYAN);
+            } else {
+                wRect(468, 600, 16, 120, TFT_CYAN);
+            }
+            break;
+    }
+}
+
 void drawTrackWorld(int mapIdx) {
     switch (mapIdx) {
 
@@ -540,15 +626,7 @@ void drawTrackWorld(int mapIdx) {
             wEllipse(640, 480, 500, 340, TFT_WHITE);
             wEllipse(640, 480, 340, 180, TFT_WHITE);
 
-            // Four vertical checkpoint guides spanning the drivable grey ring.
-            wRect(312, 180, 16, 160, TFT_CYAN);
-            wRect(312, 620, 16, 160, TFT_CYAN);
-            wRect(472, 180, 16, 160, TFT_CYAN);
-            wRect(472, 620, 16, 160, TFT_CYAN);
-            wRect(792, 180, 16, 160, TFT_CYAN);
-            wRect(792, 620, 16, 160, TFT_CYAN);
-            wRect(952, 180, 16, 160, TFT_CYAN);
-            wRect(952, 620, 16, 160, TFT_CYAN);
+            drawActiveCheckpointGuide(mapIdx);
             break;
 
         // ── CITY CIRCUIT ── cross-shaped road with centre lines ───────────────
@@ -565,11 +643,7 @@ void drawTrackWorld(int mapIdx) {
             wRect(512, 120, 16, 720, 0x9CD3);
             wRect(672, 120, 16, 720, 0x9CD3);
 
-            // Four vertical checkpoint guides spanning top-to-bottom grey road.
-            wRect(540, 120, 16, 720, TFT_CYAN);
-            wRect(572, 120, 16, 720, TFT_CYAN);
-            wRect(612, 120, 16, 720, TFT_CYAN);
-            wRect(644, 120, 16, 720, TFT_CYAN);
+            drawActiveCheckpointGuide(mapIdx);
             break;
 
         // ── RAINBOW ROAD ── colourful rectangular loop ────────────────────────
@@ -586,13 +660,7 @@ void drawTrackWorld(int mapIdx) {
             // Black interior cutout
             wRect(270, 300, 740, 360, TFT_BLACK);
 
-            // Four vertical checkpoint guides spanning top-to-bottom road sections.
-            wRect(182, 150, 16, 660, TFT_CYAN);
-            wRect(402, 150, 16, 150, TFT_CYAN);
-            wRect(402, 660, 16, 150, TFT_CYAN);
-            wRect(857, 150, 16, 150, TFT_CYAN);
-            wRect(857, 660, 16, 150, TFT_CYAN);
-            wRect(1077, 150, 16, 660, TFT_CYAN);
+            drawActiveCheckpointGuide(mapIdx);
             break;
         }
 
@@ -618,15 +686,7 @@ void drawTrackWorld(int mapIdx) {
                 wLine(x1, y1, x2, y2, TFT_WHITE);
             }
 
-            // Four vertical checkpoint guides spanning top-to-bottom of the oval area.
-            wRect(468, 240, 16, 120, TFT_CYAN);
-            wRect(468, 600, 16, 120, TFT_CYAN);
-            wRect(548, 240, 16, 120, TFT_CYAN);
-            wRect(548, 600, 16, 120, TFT_CYAN);
-            wRect(708, 240, 16, 120, TFT_CYAN);
-            wRect(708, 600, 16, 120, TFT_CYAN);
-            wRect(788, 240, 16, 120, TFT_CYAN);
-            wRect(788, 600, 16, 120, TFT_CYAN);
+            drawActiveCheckpointGuide(mapIdx);
             break;
     }
 }
@@ -780,7 +840,7 @@ void resetPlayerForMap() {
     playerHeadingRad = 1.5707963f;
     currentLap = 1;
     checkpointSequencePos = 0;
-    for (int i = 0; i < NUM_CHECKPOINTS; i++) {
+    for (int i = 0; i < MAX_CHECKPOINTS; i++) {
         wasInCheckpoint[i] = false;
     }
     lastRaceUpdateMs = 0;
@@ -836,10 +896,14 @@ bool isInCheckpointZone(int mapIdx, int checkpointIdx, float x, float y) {
 
     switch (mapIdx) {
         case 0: // OVAL
-            if      (checkpointIdx == 0) return inVerticalGateSpan(x, y, 312.0f, 16.0f, 180.0f, 340.0f, 620.0f, 780.0f);
-            else if (checkpointIdx == 1) return inVerticalGateSpan(x, y, 472.0f, 16.0f, 180.0f, 340.0f, 620.0f, 780.0f);
-            else if (checkpointIdx == 2) return inVerticalGateSpan(x, y, 792.0f, 16.0f, 180.0f, 340.0f, 620.0f, 780.0f);
-            else                         return inVerticalGateSpan(x, y, 952.0f, 16.0f, 180.0f, 340.0f, 620.0f, 780.0f);
+            if      (checkpointIdx == 0) return (x >= 312.0f && x <= 328.0f && y >= 180.0f && y <= 340.0f);
+            else if (checkpointIdx == 1) return (x >= 472.0f && x <= 488.0f && y >= 180.0f && y <= 340.0f);
+            else if (checkpointIdx == 2) return (x >= 792.0f && x <= 808.0f && y >= 180.0f && y <= 340.0f);
+            else if (checkpointIdx == 3) return (x >= 952.0f && x <= 968.0f && y >= 180.0f && y <= 340.0f);
+            else if (checkpointIdx == 4) return (x >= 952.0f && x <= 968.0f && y >= 620.0f && y <= 780.0f);
+            else if (checkpointIdx == 5) return (x >= 792.0f && x <= 808.0f && y >= 620.0f && y <= 780.0f);
+            else if (checkpointIdx == 6) return (x >= 472.0f && x <= 488.0f && y >= 620.0f && y <= 780.0f);
+            else                         return (x >= 312.0f && x <= 328.0f && y >= 620.0f && y <= 780.0f);
             break;
         case 1: // CITY CIRCUIT
             if      (checkpointIdx == 0) { zx = 540.0f; zy = 120.0f; zw = 16.0f; zh = 720.0f; }
@@ -855,10 +919,14 @@ bool isInCheckpointZone(int mapIdx, int checkpointIdx, float x, float y) {
             break;
         case 3: // POINT OVAL
         default:
-            if      (checkpointIdx == 0) return inVerticalGateSpan(x, y, 468.0f, 16.0f, 240.0f, 360.0f, 600.0f, 720.0f);
-            else if (checkpointIdx == 1) return inVerticalGateSpan(x, y, 548.0f, 16.0f, 240.0f, 360.0f, 600.0f, 720.0f);
-            else if (checkpointIdx == 2) return inVerticalGateSpan(x, y, 708.0f, 16.0f, 240.0f, 360.0f, 600.0f, 720.0f);
-            else                         return inVerticalGateSpan(x, y, 788.0f, 16.0f, 240.0f, 360.0f, 600.0f, 720.0f);
+            if      (checkpointIdx == 0) return (x >= 468.0f && x <= 484.0f && y >= 240.0f && y <= 360.0f);
+            else if (checkpointIdx == 1) return (x >= 548.0f && x <= 564.0f && y >= 240.0f && y <= 360.0f);
+            else if (checkpointIdx == 2) return (x >= 708.0f && x <= 724.0f && y >= 240.0f && y <= 360.0f);
+            else if (checkpointIdx == 3) return (x >= 788.0f && x <= 804.0f && y >= 240.0f && y <= 360.0f);
+            else if (checkpointIdx == 4) return (x >= 788.0f && x <= 804.0f && y >= 600.0f && y <= 720.0f);
+            else if (checkpointIdx == 5) return (x >= 708.0f && x <= 724.0f && y >= 600.0f && y <= 720.0f);
+            else if (checkpointIdx == 6) return (x >= 548.0f && x <= 564.0f && y >= 600.0f && y <= 720.0f);
+            else                         return (x >= 468.0f && x <= 484.0f && y >= 600.0f && y <= 720.0f);
             break;
     }
 
@@ -866,12 +934,17 @@ bool isInCheckpointZone(int mapIdx, int checkpointIdx, float x, float y) {
 }
 
 void updateLapProgress() {
-    for (int i = 0; i < NUM_CHECKPOINTS; i++) {
+    const bool splitOvalCheckpoints = (selectedMap == 0 || selectedMap == 3);
+    const int sequenceLen = splitOvalCheckpoints ? OVAL_CHECKPOINT_SEQUENCE_LEN : CHECKPOINT_SEQUENCE_LEN;
+    const int checkpointCount = splitOvalCheckpoints ? MAX_CHECKPOINTS : NUM_CHECKPOINTS;
+    const int* sequence = splitOvalCheckpoints ? OVAL_CHECKPOINT_SEQUENCE : CHECKPOINT_SEQUENCE;
+
+    for (int i = 0; i < checkpointCount; i++) {
         bool inGate = isInCheckpointZone(selectedMap, i, playerWorldX, playerWorldY);
 
-        if (i == CHECKPOINT_SEQUENCE[checkpointSequencePos] && inGate && !wasInCheckpoint[i]) {
+        if (i == sequence[checkpointSequencePos] && inGate && !wasInCheckpoint[i]) {
             checkpointSequencePos++;
-            if (checkpointSequencePos >= 8) {
+            if (checkpointSequencePos >= sequenceLen) {
                 if (currentLap >= 1 && currentLap <= TOTAL_LAPS) {
                     lapSplitMs[currentLap - 1] = raceElapsedMs - lapStartElapsedMs;
                     lapStartElapsedMs = raceElapsedMs;
@@ -1008,7 +1081,7 @@ void handleDevCombo() {
     devComboLatched = true;
     currentLap = TOTAL_LAPS;
     checkpointSequencePos = 0;
-    for (int i = 0; i < NUM_CHECKPOINTS; i++) {
+    for (int i = 0; i < MAX_CHECKPOINTS; i++) {
         wasInCheckpoint[i] = false;
     }
     for (int i = 0; i < TOTAL_LAPS; i++) {
