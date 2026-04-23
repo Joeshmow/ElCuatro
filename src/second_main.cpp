@@ -150,7 +150,7 @@ unsigned long bleTransportModeStartedMs = 0;
 unsigned long bleTransportRetryMs = 0;
 unsigned long bleLastPeerSeenMs = 0;
 
-#define BLE_FORCE_ROLE_HOST
+#define BLE_FORCE_ROLE_CLIENT
 
 #if defined(BLE_FORCE_ROLE_HOST)
 static const int kForcedBleRole = 1;
