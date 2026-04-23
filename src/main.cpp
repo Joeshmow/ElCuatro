@@ -19,6 +19,7 @@ static const bool GCP_ALLOW_INSECURE_TLS = true;
 enum GameState {
     START_SCREEN,
     CHARACTER_SELECT,
+    CONNECTION_WAIT,
     MAP_SELECT,
     COUNTDOWN,
     RACE,
@@ -108,6 +109,67 @@ unsigned long raceElapsedMs = 0;
 bool finalResultInputUnlocked = false;
 bool devComboLatched = false;
 
+static const char* BLE_SERVICE_UUID = "62d15720-755e-42cf-ab5b-4f4e2d08dcb7";
+static const char* BLE_RACE_CHAR_UUID = "95e6a553-9308-4ce2-b803-95f9e0388dd0";
+static const uint8_t BLE_PACKET_VERSION = 1;
+static const uint8_t BLE_ROLE_FLAG_HOST = 0x01;
+static const uint8_t BLE_ROLE_FLAG_RACE_FINISHED = 0x02;
+
+struct RaceStatePacket {
+    uint8_t version;
+    uint8_t roleFlags;
+    uint8_t mapIndex;
+    uint8_t vehicleIndex;
+    uint8_t lap;
+    uint8_t checkpointSeqPos;
+    float worldX;
+    float worldY;
+    float headingRad;
+    uint32_t elapsedMs;
+    uint64_t nodeId;
+};
+
+NimBLEServer* bleServer = nullptr;
+NimBLECharacteristic* bleRaceCharacteristic = nullptr;
+NimBLEClient* bleClient = nullptr;
+NimBLERemoteCharacteristic* bleRemoteRaceCharacteristic = nullptr;
+bool bleInitialized = false;
+bool bleServerPeerConnected = false;
+bool bleClientPeerConnected = false;
+unsigned long lastBleSyncMs = 0;
+String bleLocalAddress = "";
+uint64_t bleLocalNodeId = 0;
+uint64_t blePeerNodeId = 0;
+bool bleIsHost = true;
+bool bleRoleResolved = false;
+bool bleTransportHostMode = true;
+bool bleRoleChosen = false;
+unsigned long bleTransportModeStartedMs = 0;
+unsigned long bleTransportRetryMs = 0;
+unsigned long bleLastPeerSeenMs = 0;
+
+#if defined(BLE_FORCE_ROLE_HOST) && defined(BLE_FORCE_ROLE_CLIENT)
+#error "Define only one of BLE_FORCE_ROLE_HOST or BLE_FORCE_ROLE_CLIENT"
+#endif
+
+#if defined(BLE_FORCE_ROLE_HOST)
+static const int kForcedBleRole = 1;
+#elif defined(BLE_FORCE_ROLE_CLIENT)
+static const int kForcedBleRole = -1;
+#else
+static const int kForcedBleRole = 0;
+#endif
+
+float opponentWorldX = 0.0f;
+float opponentWorldY = 0.0f;
+float opponentHeadingRad = 0.0f;
+uint8_t opponentVehicleIndex = 0;
+uint8_t opponentMapIndex = 0;
+uint8_t opponentLap = 1;
+unsigned long opponentRaceElapsedMs = 0;
+unsigned long opponentLastUpdateMs = 0;
+bool opponentStateValid = false;
+
 const int PLAYER_NAME_LENGTH = 3;
 char currentPlayerName[PLAYER_NAME_LENGTH + 1] = "YOU";
 char nameEditBuffer[PLAYER_NAME_LENGTH + 1] = "YOU";
@@ -177,6 +239,7 @@ void handleCurrentState();
 
 void drawStartScreen();
 void drawCharacterSelect();
+void drawConnectionWait();
 void drawMapSelect();
 void drawCountdown();
 void drawRace();
@@ -188,6 +251,7 @@ void drawBackToMenu();
 
 void handleStartScreenTouch();
 void handleCharacterSelectTouch();
+void handleConnectionWaitTouch();
 void handleMapSelectTouch();
 void handleRaceTouch();
 void handleNameSelectInput();
@@ -209,6 +273,7 @@ void wEllipse(int wx, int wy, int rx, int ry, uint16_t col);
 void drawTrackWorld(int mapIdx);
 void drawActiveCheckpointGuide(int mapIdx);
 void drawMapPreviewBox(int mapIdx, int bx, int by, int bw, int bh);
+void drawOpponentVehicleWorld();
 void drawRaceHUD();
 void resetPlayerForMap();
 void updateRaceMotion();
@@ -219,8 +284,31 @@ void retargetControlTween(float steer);
 void handleDevCombo();
 bool isInCheckpointZone(int mapIdx, int checkpointIdx, float x, float y);
 void updateLapProgress();
+void updateBleAuthorityRole(uint64_t peerNodeId);
+bool getBleLinkConnected();
+bool getBleDataLinkReady();
+void applyBleTransportMode(bool hostMode);
+void refreshBleTransportMode();
+void setBleRole(bool hostMode);
 void captureRaceResultForLeaderboard();
 void formatRaceTime(unsigned long elapsedMs, char* buffer, size_t bufferSize);
+
+static uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t mix) {
+    uint8_t fgR = (fg >> 11) & 0x1F;
+    uint8_t fgG = (fg >> 5) & 0x3F;
+    uint8_t fgB = fg & 0x1F;
+
+    uint8_t bgR = (bg >> 11) & 0x1F;
+    uint8_t bgG = (bg >> 5) & 0x3F;
+    uint8_t bgB = bg & 0x1F;
+
+    uint8_t invMix = 255 - mix;
+    uint8_t outR = (uint8_t)((fgR * mix + bgR * invMix) / 255);
+    uint8_t outG = (uint8_t)((fgG * mix + bgG * invMix) / 255);
+    uint8_t outB = (uint8_t)((fgB * mix + bgB * invMix) / 255);
+
+    return (uint16_t)((outR << 11) | (outG << 5) | outB);
+}
 
 void initBLE();
 void stopBLE();
@@ -228,6 +316,7 @@ void initWiFi();
 void uploadScoreToGCP();
 void syncLeaderboardToGCP();
 void syncRaceStateBLE();
+void handleIncomingRacePacket(const uint8_t* data, size_t len);
 
 int charSetIndex(char c);
 
@@ -239,6 +328,11 @@ void setup() {
     M5.Display.fillScreen(TFT_BLACK);
     Serial.begin(115200);
     initGamepadQT();
+    initBLE();
+
+    if (kForcedBleRole != 0) {
+        setBleRole(kForcedBleRole > 0);
+    }
 
     if (strlen(LEADERBOARD_PLAYER_NAME) > 0) {
         strncpy(currentPlayerName, LEADERBOARD_PLAYER_NAME, sizeof(currentPlayerName) - 1);
@@ -276,6 +370,7 @@ void limitFrameRate() {
 // ─── Main Loop ────────────────────────────────────────────────────────────────
 void loop() {
     M5.update();
+    refreshBleTransportMode();
     if (currentState != previousState) {
         screenNeedsRedraw = true;
         previousState = currentState;
@@ -321,6 +416,15 @@ void handleCurrentState() {
                 screenNeedsRedraw = false;
             }
             handleCharacterSelectTouch();
+            break;
+
+        case CONNECTION_WAIT:
+            syncRaceStateBLE();
+            if (screenNeedsRedraw) {
+                drawConnectionWait();
+                screenNeedsRedraw = false;
+            }
+            handleConnectionWaitTouch();
             break;
 
         case MAP_SELECT:
@@ -850,6 +954,8 @@ void resetPlayerForMap() {
     for (int i = 0; i < TOTAL_LAPS; i++) {
         lapSplitMs[i] = 0;
     }
+    opponentStateValid = false;
+    opponentLastUpdateMs = 0;
     raceNeedsRedraw = true;
 }
 
@@ -1036,7 +1142,7 @@ void updateRaceMotion() {
     // Apply throttle directly without smoothing for immediate response
     smoothedThrottle = throttleScale;
 
-    if (raceStartMs != 0) {
+    if (raceStartMs != 0 && (!bleConnected || !bleRoleResolved || bleIsHost)) {
         raceElapsedMs = millis() - raceStartMs;
     }
 
@@ -1065,7 +1171,9 @@ void updateRaceMotion() {
     if (playerWorldY < WALL_MARGIN) playerWorldY = WALL_MARGIN;
     if (playerWorldY > WORLD_HEIGHT - WALL_MARGIN) playerWorldY = WORLD_HEIGHT - WALL_MARGIN;
 
-    updateLapProgress();
+    if (!bleConnected || !bleRoleResolved || bleIsHost) {
+        updateLapProgress();
+    }
 
     raceNeedsRedraw = true;
 }
@@ -1107,10 +1215,82 @@ void drawRaceHUD() {
     formatRaceTime(raceElapsedMs, timerBuf, sizeof(timerBuf));
     disp.drawString(timerBuf, 244, 2, 1);
 
+    // BLE link and authority role status centered at the top.
+    disp.fillRect(108, 0, 44, 18, TFT_BLACK);
+    disp.setTextColor(bleConnected ? TFT_GREEN : TFT_RED, TFT_BLACK);
+    const char* roleTag = bleIsHost ? "H" : (bleRoleResolved ? "C" : "?");
+    char p2Buf[10];
+    if (bleConnected) snprintf(p2Buf, sizeof(p2Buf), "P2 %s", roleTag);
+    else snprintf(p2Buf, sizeof(p2Buf), "P2 OFF");
+    disp.drawString(p2Buf, 110, 2, 1);
+
     // Vehicle name badge bottom-left
     disp.fillRect(0, 224, 90, 16, TFT_BLACK);
     disp.setTextColor(vehicles[selectedCharacter].color, TFT_BLACK);
     disp.drawString(vehicles[selectedCharacter].name, 4, 225, 1);
+
+    // Always-on mini-map so both karts' movement is visible even when one is off-camera.
+    const int miniX = 256;
+    const int miniY = 204;
+    const int miniW = 60;
+    const int miniH = 34;
+    disp.fillRect(miniX, miniY, miniW, miniH, TFT_BLACK);
+    disp.drawRect(miniX, miniY, miniW, miniH, TFT_DARKGREY);
+
+    auto worldToMiniX = [&](float wx) {
+        float n = wx / (float)WORLD_WIDTH;
+        if (n < 0.0f) n = 0.0f;
+        if (n > 1.0f) n = 1.0f;
+        return miniX + 2 + (int)(n * (float)(miniW - 5));
+    };
+    auto worldToMiniY = [&](float wy) {
+        float n = wy / (float)WORLD_HEIGHT;
+        if (n < 0.0f) n = 0.0f;
+        if (n > 1.0f) n = 1.0f;
+        return miniY + 2 + (int)(n * (float)(miniH - 5));
+    };
+
+    int selfMiniX = worldToMiniX(playerWorldX);
+    int selfMiniY = worldToMiniY(playerWorldY);
+    disp.fillCircle(selfMiniX, selfMiniY, 2, TFT_CYAN);
+
+    const bool opponentFresh = opponentStateValid && (millis() - opponentLastUpdateMs <= 1500);
+    if (opponentFresh) {
+        int oppMiniX = worldToMiniX(opponentWorldX);
+        int oppMiniY = worldToMiniY(opponentWorldY);
+        disp.fillCircle(oppMiniX, oppMiniY, 2, TFT_YELLOW);
+    }
+}
+
+void drawOpponentVehicleWorld() {
+    if (!opponentStateValid) return;
+    if (opponentMapIndex != (uint8_t)selectedMap) return;
+    if (millis() - opponentLastUpdateMs > 1500) return;
+
+    int sx = 0;
+    int sy = 0;
+    worldToScreen(opponentWorldX, opponentWorldY, sx, sy);
+    if (sx < -30 || sx > 350 || sy < -30 || sy > 270) return;
+
+    auto& disp = useSpriteRenderer ? (M5GFX&)frameSprite : (M5GFX&)M5.Display;
+    float cos_a = cosf(opponentHeadingRad);
+    float sin_a = sinf(opponentHeadingRad);
+    uint16_t col = vehicles[opponentVehicleIndex % NUM_VEHICLES].color;
+    uint16_t ghostCol = col;
+    uint16_t edgeCol = col;
+
+    int x1 = sx + (int)(sin_a * 14);
+    int y1 = sy - (int)(cos_a * 14);
+    int x2 = sx - (int)(sin_a * 9) + (int)(cos_a * 10);
+    int y2 = sy + (int)(cos_a * 9) + (int)(sin_a * 10);
+    int x3 = sx - (int)(sin_a * 9) - (int)(cos_a * 10);
+    int y3 = sy + (int)(cos_a * 9) - (int)(sin_a * 10);
+
+    disp.fillTriangle(x1, y1, x2, y2, x3, y3, ghostCol);
+    disp.drawLine(x1, y1, x2, y2, edgeCol);
+    disp.drawLine(x2, y2, x3, y3, edgeCol);
+    disp.drawLine(x3, y3, x1, y1, edgeCol);
+    disp.fillCircle(sx, sy, 2, edgeCol);
 }
 
 void drawRace() {
@@ -1121,6 +1301,9 @@ void drawRace() {
 
         // 2. Draw all track geometry offset by camera — world scrolls, player stays centred
         drawTrackWorld(selectedMap);
+
+        // Remote player kart in world-space, if a peer is connected.
+        drawOpponentVehicleWorld();
 
         // 3. Player vehicle is ALWAYS drawn at exact screen centre
         drawVehicle(selectedCharacter, 160, 120);
@@ -1138,6 +1321,9 @@ void drawRace() {
 
         // 2. Draw all track geometry offset by camera — world scrolls, player stays centred
         drawTrackWorld(selectedMap);
+
+        // Remote player kart in world-space, if a peer is connected.
+        drawOpponentVehicleWorld();
 
         // 3. Player vehicle is ALWAYS drawn at exact screen centre
         drawVehicle(selectedCharacter, 160, 120);
@@ -1214,6 +1400,72 @@ void handleCharacterSelectTouch() {
         delay(80);
         drawCharacterSelect();
         delay(120);
+        changeState(CONNECTION_WAIT);
+    }
+}
+
+void drawConnectionWait() {
+    bool transportConnected = getBleLinkConnected();
+    bool dataLinked = getBleDataLinkReady();
+
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawCentreString("PAIRING CHECK", 160, 34, 2);
+    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    M5.Display.drawCentreString("Waiting for data link", 160, 70, 1);
+
+    const char* roleTag = bleTransportHostMode ? "HOST" : "CLIENT";
+    M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+    M5.Display.drawCentreString(roleTag, 160, 94, 2);
+
+    if (dataLinked) {
+        M5.Display.fillRoundRect(44, 126, 232, 50, 8, TFT_DARKGREEN);
+        M5.Display.drawRoundRect(44, 126, 232, 50, 8, TFT_GREEN);
+        M5.Display.setTextColor(TFT_GREENYELLOW, TFT_DARKGREEN);
+        M5.Display.drawCentreString("LINKED", 160, 142, 2);
+
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.drawCentreString("Tap or BtnB to continue", 160, 206, 1);
+    } else {
+        M5.Display.fillRoundRect(44, 126, 232, 50, 8, 0x2104);
+        M5.Display.drawRoundRect(44, 126, 232, 50, 8, TFT_RED);
+        M5.Display.setTextColor(TFT_RED, 0x2104);
+        M5.Display.drawCentreString("NOT LINKED", 160, 142, 2);
+
+        M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        M5.Display.drawCentreString("Keep both devices here", 160, 188, 1);
+        M5.Display.drawCentreString("Wait for packet exchange", 160, 206, 1);
+    }
+
+    M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    char dbgBuf[28];
+    unsigned long seenAge = (bleLastPeerSeenMs == 0) ? 9999 : (millis() - bleLastPeerSeenMs);
+    snprintf(dbgBuf, sizeof(dbgBuf), "T%d D%d S%lu", transportConnected ? 1 : 0, dataLinked ? 1 : 0, seenAge);
+    M5.Display.drawCentreString(dbgBuf, 160, 224, 1);
+}
+
+void handleConnectionWaitTouch() {
+    static unsigned long lastConnectionUiRefreshMs = 0;
+    static bool lastShownConnected = false;
+
+    getBleLinkConnected();
+    const bool connectedNow = getBleDataLinkReady();
+    unsigned long now = millis();
+    if (connectedNow != lastShownConnected || (now - lastConnectionUiRefreshMs) > 400) {
+        drawConnectionWait();
+        lastShownConnected = connectedNow;
+        lastConnectionUiRefreshMs = now;
+    }
+
+    if (!connectedNow) return;
+
+    auto touch = M5.Touch.getDetail();
+    if (touch.state == m5::touch_state_t::touch_begin) {
+        changeState(MAP_SELECT);
+        return;
+    }
+
+    if (M5.BtnB.wasClicked()) {
         changeState(MAP_SELECT);
     }
 }
@@ -1356,8 +1608,21 @@ void drawBuggy(int cx, int cy, uint16_t col) {
 void drawStartScreen() {
     M5.Display.fillScreen(TFT_BLACK);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.drawCentreString("KART RACER", 160, 60, 4);
-    M5.Display.drawCentreString("Touch to Start", 160, 180, 2);
+    M5.Display.drawCentreString("KART RACER", 160, 48, 4);
+    if (kForcedBleRole == 0) {
+        M5.Display.drawCentreString("Tap LEFT or BtnA = HOST", 160, 142, 2);
+        M5.Display.drawCentreString("Tap RIGHT or BtnC = CLIENT", 160, 164, 2);
+    } else {
+        M5.Display.drawCentreString("Role is fixed by firmware", 160, 142, 2);
+        M5.Display.drawCentreString("Tap screen to continue", 160, 164, 2);
+    }
+    if (bleRoleChosen) {
+        M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+        M5.Display.drawCentreString(bleTransportHostMode ? "MODE: HOST" : "MODE: CLIENT", 160, 194, 2);
+    } else {
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.drawCentreString("Select multiplayer mode", 160, 194, 2);
+    }
 }
 
 void drawCountdown() {
@@ -1501,9 +1766,39 @@ void drawBackToMenu() {
 // REMAINING TOUCH HANDLERS
 // =============================================================================
 
+void setBleRole(bool hostMode) {
+    bleTransportHostMode = hostMode;
+    bleRoleChosen = true;
+    applyBleTransportMode(bleTransportHostMode);
+}
+
 void handleStartScreenTouch() {
     auto touch = M5.Touch.getDetail();
-    if (touch.state == m5::touch_state_t::touch_begin) changeState(CHARACTER_SELECT);
+
+    if (kForcedBleRole != 0) {
+        if (touch.state == m5::touch_state_t::touch_begin || M5.BtnA.wasClicked() || M5.BtnC.wasClicked()) {
+            changeState(CHARACTER_SELECT);
+        }
+        return;
+    }
+
+    if (touch.state == m5::touch_state_t::touch_begin) {
+        if (touch.x < 160) {
+            setBleRole(true);
+        } else {
+            setBleRole(false);
+        }
+        changeState(CHARACTER_SELECT);
+        return;
+    }
+
+    if (M5.BtnA.wasClicked()) {
+        setBleRole(true);
+        changeState(CHARACTER_SELECT);
+    } else if (M5.BtnC.wasClicked()) {
+        setBleRole(false);
+        changeState(CHARACTER_SELECT);
+    }
 }
 
 void handleRaceTouch() {
@@ -1516,8 +1811,358 @@ void handleRaceTouch() {
 // =============================================================================
 // BLE / WiFi / GCP STUBS
 // =============================================================================
-void initBLE()          { /* TODO */ }
-void stopBLE()          { /* TODO */ }
+void updateBleAuthorityRole(uint64_t peerNodeId) {
+    if (peerNodeId == 0 || peerNodeId == bleLocalNodeId) return;
+
+    blePeerNodeId = peerNodeId;
+    bleIsHost = (bleLocalNodeId < blePeerNodeId);
+    bleRoleResolved = true;
+}
+
+bool getBleLinkConnected() {
+    bool serverConnectedNow = false;
+    bool clientConnectedNow = false;
+
+    if (bleServer != nullptr) {
+        serverConnectedNow = (bleServer->getConnectedCount() > 0);
+    }
+
+    if (bleClient != nullptr) {
+        clientConnectedNow = bleClient->isConnected();
+    }
+
+    // Client-side fallback: remote characteristic can remain valid when isConnected is transient.
+    if (!clientConnectedNow && bleRemoteRaceCharacteristic != nullptr) {
+        clientConnectedNow = true;
+    }
+
+    const unsigned long now = millis();
+    const bool recentlySeenPeer = (bleLastPeerSeenMs != 0) && (now - bleLastPeerSeenMs <= 3000);
+
+    bleServerPeerConnected = serverConnectedNow;
+    bleClientPeerConnected = clientConnectedNow;
+
+    if (!clientConnectedNow && !recentlySeenPeer) {
+        bleRemoteRaceCharacteristic = nullptr;
+    }
+
+    bleConnected = bleServerPeerConnected || bleClientPeerConnected || recentlySeenPeer;
+    return bleConnected;
+}
+
+bool getBleDataLinkReady() {
+    const unsigned long now = millis();
+    return (bleLastPeerSeenMs != 0) && (now - bleLastPeerSeenMs <= 1500);
+}
+
+void applyBleTransportMode(bool hostMode) {
+    bleTransportHostMode = hostMode;
+    bleTransportModeStartedMs = millis();
+
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
+
+    if (scan != nullptr) {
+        scan->stop();
+    }
+    if (advertising != nullptr) {
+        advertising->stop();
+    }
+
+    if (hostMode) {
+        if (advertising != nullptr) {
+            advertising->addServiceUUID(BLE_SERVICE_UUID);
+            advertising->start();
+        }
+    } else {
+        if (scan != nullptr) {
+            scan->start(0, false, true);
+        }
+    }
+}
+
+void refreshBleTransportMode() {
+    if (!bleInitialized) return;
+
+    // If client mode and not connected, restart scan to find and reconnect to host.
+    if (!bleTransportHostMode && currentState == CONNECTION_WAIT) {
+        if (bleClient != nullptr && !bleClient->isConnected()) {
+            NimBLEScan* scan = NimBLEDevice::getScan();
+            if (scan != nullptr && !scan->isScanning()) {
+                bleRemoteRaceCharacteristic = nullptr;
+                bleClientPeerConnected = false;
+                scan->start(0, false, true);
+            }
+        }
+    }
+
+    bool linkConnected = getBleLinkConnected();
+    if (linkConnected) return;
+    if (bleConnected) return;
+    if (bleTransportRetryMs == 0) return;
+}
+
+void handleIncomingRacePacket(const uint8_t* data, size_t len) {
+    if (data == nullptr || len < sizeof(RaceStatePacket)) return;
+
+    RaceStatePacket packet;
+    memcpy(&packet, data, sizeof(RaceStatePacket));
+    if (packet.version != BLE_PACKET_VERSION) return;
+
+    bleLastPeerSeenMs = millis();
+    bleConnected = true;
+
+    updateBleAuthorityRole(packet.nodeId);
+
+    const bool senderIsHost = (packet.roleFlags & BLE_ROLE_FLAG_HOST) != 0;
+    const bool senderRaceFinished = (packet.roleFlags & BLE_ROLE_FLAG_RACE_FINISHED) != 0;
+
+    if (senderIsHost && !bleIsHost && packet.mapIndex < NUM_MAPS) {
+        selectedMap = packet.mapIndex;
+        previewMap = packet.mapIndex;
+    }
+
+    opponentWorldX = packet.worldX;
+    opponentWorldY = packet.worldY;
+    opponentHeadingRad = packet.headingRad;
+    opponentVehicleIndex = packet.vehicleIndex;
+    opponentMapIndex = packet.mapIndex;
+    opponentLap = packet.lap;
+    opponentRaceElapsedMs = packet.elapsedMs;
+    opponentLastUpdateMs = millis();
+    opponentStateValid = true;
+
+    if (senderIsHost && !bleIsHost && packet.mapIndex == (uint8_t)selectedMap) {
+        const bool splitOvalCheckpoints = (selectedMap == 0 || selectedMap == 3);
+        const int sequenceLen = splitOvalCheckpoints ? OVAL_CHECKPOINT_SEQUENCE_LEN : CHECKPOINT_SEQUENCE_LEN;
+
+        int remoteLap = (int)packet.lap;
+        if (remoteLap < 1) remoteLap = 1;
+        if (remoteLap > TOTAL_LAPS + 1) remoteLap = TOTAL_LAPS + 1;
+
+        currentLap = remoteLap;
+        checkpointSequencePos = (int)packet.checkpointSeqPos;
+        if (checkpointSequencePos < 0) checkpointSequencePos = 0;
+        if (checkpointSequencePos >= sequenceLen) checkpointSequencePos = sequenceLen - 1;
+        raceElapsedMs = packet.elapsedMs;
+
+        if (senderRaceFinished) {
+        currentLap = TOTAL_LAPS + 1;
+        checkpointSequencePos = 0;
+        }
+    }
+}
+
+class BleRaceCharCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+        Serial.printf("[BLE] onWrite callback: received packet\n");
+        const std::string payload = c->getValue();
+        Serial.printf("[BLE] onWrite payload size: %d\n", payload.size());
+        bleLastPeerSeenMs = millis();
+        bleConnected = true;
+        handleIncomingRacePacket((const uint8_t*)payload.data(), payload.size());
+        (void)connInfo;
+    }
+};
+
+class BleServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* s, NimBLEConnInfo& i) override {
+        Serial.printf("[BLE] Server: Client connected!\n");
+        bleServerPeerConnected = true;
+        bleConnected = true;
+        bleLastPeerSeenMs = millis();
+        (void)s;
+        (void)i;
+    }
+
+    void onDisconnect(NimBLEServer* s, NimBLEConnInfo& i, int r) override {
+        Serial.printf("[BLE] Server: Client disconnected (reason: %d)\n", r);
+        bleServerPeerConnected = false;
+        bleConnected = bleClientPeerConnected;
+        if (!bleConnected) {
+            blePeerNodeId = 0;
+            bleRoleResolved = false;
+            bleIsHost = true;
+            applyBleTransportMode(bleTransportHostMode);
+        }
+        (void)s;
+        (void)i;
+    }
+};
+
+class BleClientCallbacks : public NimBLEClientCallbacks {
+    void onConnect(NimBLEClient* c) override {
+        bleClientPeerConnected = true;
+        bleConnected = true;
+        bleLastPeerSeenMs = millis();
+        (void)c;
+    }
+
+    void onDisconnect(NimBLEClient* c, int reason) override {
+        bleClientPeerConnected = false;
+        bleRemoteRaceCharacteristic = nullptr;
+        bleConnected = bleServerPeerConnected;
+        if (!bleConnected) {
+            blePeerNodeId = 0;
+            bleRoleResolved = false;
+            bleIsHost = true;
+            applyBleTransportMode(bleTransportHostMode);
+        }
+        (void)c;
+        (void)reason;
+    }
+};
+
+static BleRaceCharCallbacks bleRaceCharCallbacks;
+static BleServerCallbacks bleServerCallbacks;
+static BleClientCallbacks bleClientCallbacks;
+
+static void onBleRaceNotify(NimBLERemoteCharacteristic* c, uint8_t* data, size_t len, bool isNotify) {
+    Serial.printf("[BLE] onBleRaceNotify: received %d bytes\n", len);
+    bleLastPeerSeenMs = millis();
+    bleConnected = true;
+    handleIncomingRacePacket(data, len);
+    (void)c;
+    (void)isNotify;
+}
+
+class BleScanCallbacks : public NimBLEScanCallbacks {
+    void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+        if (advertisedDevice == nullptr) return;
+        if (bleRemoteRaceCharacteristic != nullptr && bleClient != nullptr && bleClient->isConnected()) {
+            Serial.println("[BLE] Already connected, ignoring scan result");
+            return;
+        }
+        if (bleClient != nullptr && bleClient->isConnected()) {
+            Serial.println("[BLE] Client already connected, ignoring");
+            return;
+        }
+        if (!advertisedDevice->isAdvertisingService(NimBLEUUID(BLE_SERVICE_UUID))) return;
+
+        String peerAddress = String(advertisedDevice->getAddress().toString().c_str());
+        if (peerAddress == bleLocalAddress) return;
+
+        Serial.printf("[BLE] Scan found host: %s\n", peerAddress.c_str());
+        NimBLEScan* scan = NimBLEDevice::getScan();
+        if (scan != nullptr) {
+            scan->stop();
+        }
+
+        if (bleClient == nullptr) {
+            Serial.println("[BLE] Creating new client");
+            bleClient = NimBLEDevice::createClient();
+            bleClient->setClientCallbacks(&bleClientCallbacks, false);
+        }
+
+        Serial.println("[BLE] Attempting connect...");
+        if (!bleClient->connect(advertisedDevice)) {
+            Serial.println("[BLE] Connect failed, restarting scan");
+            if (currentState == CONNECTION_WAIT && scan != nullptr) {
+                scan->start(0, false, true);
+            }
+            return;
+        }
+
+        Serial.println("[BLE] Connect succeeded, getting service...");
+        NimBLERemoteService* service = bleClient->getService(BLE_SERVICE_UUID);
+        if (service == nullptr) {
+            Serial.println("[BLE] Service not found, disconnecting");
+            bleClient->disconnect();
+            if (currentState == CONNECTION_WAIT && scan != nullptr) {
+                scan->start(0, false, true);
+            }
+            return;
+        }
+
+        Serial.println("[BLE] Service found, getting characteristic...");
+        bleRemoteRaceCharacteristic = service->getCharacteristic(BLE_RACE_CHAR_UUID);
+        if (bleRemoteRaceCharacteristic == nullptr) {
+            Serial.println("[BLE] Characteristic not found, disconnecting");
+            bleClient->disconnect();
+            if (currentState == CONNECTION_WAIT && scan != nullptr) {
+                scan->start(0, false, true);
+            }
+            return;
+        }
+
+        Serial.println("[BLE] Characteristic found, checking canNotify...");
+        if (bleRemoteRaceCharacteristic->canNotify()) {
+            Serial.println("[BLE] Subscribing to notifications...");
+            bleRemoteRaceCharacteristic->subscribe(true, onBleRaceNotify);
+            Serial.println("[BLE] Subscribe called");
+        }
+
+        bleClientPeerConnected = true;
+        bleConnected = true;
+        bleLastPeerSeenMs = millis();
+        Serial.printf("[BLE] CLIENT CONNECTED! isConnected=%d, charNotNull=%d\n", 
+                      bleClient->isConnected() ? 1 : 0, 
+                      bleRemoteRaceCharacteristic != nullptr ? 1 : 0);
+    }
+};
+
+static BleScanCallbacks bleScanCallbacks;
+
+void initBLE() {
+        if (bleInitialized) return;
+
+        NimBLEDevice::init("M5-KART");
+        bleLocalAddress = String(NimBLEDevice::getAddress().toString().c_str());
+    bleLocalNodeId = ESP.getEfuseMac();
+    blePeerNodeId = 0;
+    bleIsHost = true;
+    bleRoleResolved = false;
+    bleTransportHostMode = true;
+    bleRoleChosen = false;
+    bleTransportRetryMs = 0;
+
+        bleServer = NimBLEDevice::createServer();
+        bleServer->setCallbacks(&bleServerCallbacks);
+
+        NimBLEService* service = bleServer->createService(BLE_SERVICE_UUID);
+        bleRaceCharacteristic = service->createCharacteristic(
+                BLE_RACE_CHAR_UUID,
+                NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY
+        );
+        bleRaceCharacteristic->setCallbacks(&bleRaceCharCallbacks);
+        RaceStatePacket initPacket = {};
+        initPacket.version = BLE_PACKET_VERSION;
+        bleRaceCharacteristic->setValue((uint8_t*)&initPacket, sizeof(initPacket));
+        service->start();
+
+        NimBLEScan* scan = NimBLEDevice::getScan();
+        scan->setScanCallbacks(&bleScanCallbacks, false);
+        scan->setInterval(45);
+        scan->setWindow(15);
+        scan->setActiveScan(true);
+
+        applyBleTransportMode(bleTransportHostMode);
+
+        bleInitialized = true;
+        bleConnected = false;
+}
+
+void stopBLE() {
+        if (!bleInitialized) return;
+
+        NimBLEDevice::getScan()->stop();
+        NimBLEDevice::getAdvertising()->stop();
+        if (bleClient != nullptr && bleClient->isConnected()) {
+                bleClient->disconnect();
+        }
+
+        bleRemoteRaceCharacteristic = nullptr;
+        bleServerPeerConnected = false;
+        bleClientPeerConnected = false;
+        bleConnected = false;
+        blePeerNodeId = 0;
+        bleRoleResolved = false;
+        bleIsHost = true;
+        bleTransportHostMode = true;
+        bleTransportModeStartedMs = 0;
+        bleTransportRetryMs = 0;
+        bleLastPeerSeenMs = 0;
+}
 void initWiFi() {
     if (strlen(WIFI_SSID) == 0 || strlen(WIFI_PASSWORD) == 0) {
         Serial.println("WiFi credentials missing in include/secrets.h");
@@ -1633,4 +2278,38 @@ void syncLeaderboardToGCP() {
     }
     delay(1500);
 }
-void syncRaceStateBLE() { /* TODO */ }
+void syncRaceStateBLE() {
+    if (!bleInitialized) return;
+
+    unsigned long now = millis();
+    if (now - lastBleSyncMs < 80) return;
+    lastBleSyncMs = now;
+
+    RaceStatePacket packet = {};
+    packet.version = BLE_PACKET_VERSION;
+    packet.roleFlags = 0;
+    if (bleIsHost) packet.roleFlags |= BLE_ROLE_FLAG_HOST;
+    if (currentLap > TOTAL_LAPS) packet.roleFlags |= BLE_ROLE_FLAG_RACE_FINISHED;
+    packet.mapIndex = (uint8_t)selectedMap;
+    packet.vehicleIndex = (uint8_t)selectedCharacter;
+    packet.lap = (uint8_t)currentLap;
+    packet.checkpointSeqPos = (uint8_t)checkpointSequencePos;
+    packet.worldX = playerWorldX;
+    packet.worldY = playerWorldY;
+    packet.headingRad = playerHeadingRad;
+    packet.elapsedMs = (uint32_t)raceElapsedMs;
+    packet.nodeId = bleLocalNodeId;
+
+    if (bleRaceCharacteristic != nullptr && bleServerPeerConnected) {
+        Serial.printf("[BLE] HOST: Sending notify (peer connected)\n");
+        bleRaceCharacteristic->setValue((uint8_t*)&packet, sizeof(packet));
+        bleRaceCharacteristic->notify();
+    }
+
+    if (bleRemoteRaceCharacteristic != nullptr && bleClient != nullptr && bleClient->isConnected()) {
+        Serial.printf("[BLE] CLIENT: Sending writeValue (isConnected=%d)\n", bleClient->isConnected() ? 1 : 0);
+        bleRemoteRaceCharacteristic->writeValue((uint8_t*)&packet, sizeof(packet), false);
+    }
+
+    bleConnected = bleServerPeerConnected || bleClientPeerConnected;
+}
